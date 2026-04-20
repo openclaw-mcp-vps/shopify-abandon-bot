@@ -1,104 +1,103 @@
-import { NextResponse } from "next/server";
+import crypto from "node:crypto";
 
-import { listStores, upsertStore } from "@/lib/database";
-import { parseAccessToken, PAYWALL_COOKIE_NAME } from "@/lib/paywall";
-import { normalizeShopDomain, validateShopifyToken } from "@/lib/shopify";
+import { NextRequest, NextResponse } from "next/server";
 
-interface ShopifyAuthRequest {
-  storeDomain: string;
-  accessToken: string;
-  senderEmail: string;
+import { upsertStoreAuth } from "@/lib/database";
+import {
+  buildShopifyAuthUrl,
+  exchangeShopifyCodeForToken,
+  isValidShopDomain,
+  normalizeShopDomain,
+  verifyShopifyOAuthHmac
+} from "@/lib/shopify";
+
+const STATE_COOKIE = "shopify_oauth_state";
+
+function errorResponse(message: string, status = 400) {
+  return NextResponse.json({ error: message }, { status });
 }
 
-function getAccessPayload(request: Request) {
-  const cookieHeader = request.headers.get("cookie") || "";
-  const token = cookieHeader
-    .split(";")
-    .map((item) => item.trim())
-    .find((item) => item.startsWith(`${PAYWALL_COOKIE_NAME}=`))
-    ?.split("=")
-    ?.slice(1)
-    ?.join("=");
+export async function GET(request: NextRequest) {
+  const params = request.nextUrl.searchParams;
+  const requestedShop = params.get("shop");
 
-  return parseAccessToken(token);
-}
+  if (!requestedShop) {
+    return errorResponse("Missing required `shop` query parameter. Example: ?shop=your-store.myshopify.com");
+  }
 
-export async function GET(request: Request): Promise<NextResponse> {
-  const url = new URL(request.url);
-  const shop = url.searchParams.get("shop");
+  const shopDomain = normalizeShopDomain(requestedShop);
 
-  if (!shop) {
-    return NextResponse.json({
-      message:
-        "POST storeDomain + accessToken + senderEmail to connect a store. For OAuth flows, redirect back here with the generated token."
+  if (!isValidShopDomain(shopDomain)) {
+    return errorResponse("Invalid Shopify shop domain.");
+  }
+
+  const code = params.get("code");
+
+  if (!code) {
+    const state = crypto.randomBytes(16).toString("hex");
+    const redirectUri = `${request.nextUrl.origin}/api/shopify/auth`;
+    const authorizeUrl = buildShopifyAuthUrl({
+      shopDomain,
+      state,
+      redirectUri
     });
+
+    const response = NextResponse.redirect(authorizeUrl);
+    response.cookies.set(STATE_COOKIE, state, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 60 * 10,
+      path: "/"
+    });
+
+    return response;
   }
 
-  return NextResponse.json({
-    message: "Shop received. Exchange code for token in your OAuth app and POST token to this endpoint.",
-    shop
-  });
-}
+  const expectedState = request.cookies.get(STATE_COOKIE)?.value;
+  const receivedState = params.get("state");
 
-export async function POST(request: Request): Promise<NextResponse> {
-  const access = getAccessPayload(request);
-  if (!access) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  if (!expectedState || !receivedState || expectedState !== receivedState) {
+    return errorResponse("Invalid OAuth state. Retry the Shopify connect flow.", 401);
   }
 
-  const body = (await request.json()) as Partial<ShopifyAuthRequest>;
-
-  if (!body.storeDomain || !body.accessToken || !body.senderEmail) {
-    return NextResponse.json(
-      {
-        error: "storeDomain, accessToken, and senderEmail are required"
-      },
-      { status: 400 }
-    );
+  if (!verifyShopifyOAuthHmac(params)) {
+    return errorResponse("Invalid Shopify OAuth signature.", 401);
   }
 
-  let storeDomain: string;
   try {
-    storeDomain = normalizeShopDomain(body.storeDomain);
+    const accessToken = await exchangeShopifyCodeForToken({
+      shopDomain,
+      code
+    });
+
+    upsertStoreAuth({
+      shopDomain,
+      accessToken
+    });
+
+    const dashboardUrl = new URL("/dashboard", request.nextUrl.origin);
+    dashboardUrl.searchParams.set("shop", shopDomain);
+    dashboardUrl.searchParams.set("connected", "1");
+
+    const response = NextResponse.redirect(dashboardUrl);
+    response.cookies.set(STATE_COOKIE, "", {
+      path: "/",
+      maxAge: 0
+    });
+    response.cookies.set("shopify_connected_shop", shopDomain, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 60 * 60 * 24 * 30,
+      path: "/"
+    });
+
+    return response;
   } catch (error) {
-    return NextResponse.json(
-      {
-        error: error instanceof Error ? error.message : "Invalid shop domain"
-      },
-      { status: 400 }
+    return errorResponse(
+      error instanceof Error ? `Failed to complete Shopify auth: ${error.message}` : "Failed to complete Shopify auth.",
+      500
     );
   }
-
-  const existingStores = await listStores();
-  if (!existingStores.some((store) => store.storeDomain === storeDomain) && existingStores.length >= access.storeLimit) {
-    return NextResponse.json(
-      {
-        error: `Plan limit reached. Your current plan supports up to ${access.storeLimit} store(s).`
-      },
-      { status: 403 }
-    );
-  }
-
-  const isValidToken = await validateShopifyToken(storeDomain, body.accessToken);
-  if (!isValidToken) {
-    return NextResponse.json(
-      {
-        error: "Shopify token validation failed. Confirm the token has read_checkouts scope."
-      },
-      { status: 401 }
-    );
-  }
-
-  const store = await upsertStore({
-    storeDomain,
-    accessToken: body.accessToken,
-    senderEmail: body.senderEmail
-  });
-
-  return NextResponse.json({
-    ok: true,
-    store,
-    plan: access.plan,
-    storeLimit: access.storeLimit
-  });
 }

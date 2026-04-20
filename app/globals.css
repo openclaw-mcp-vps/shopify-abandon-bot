@@ -1,53 +1,74 @@
 @import "tailwindcss";
 
 :root {
-  --bg: #0d1117;
+  color-scheme: dark;
+  --background: #0d1117;
   --surface: #111827;
-  --surface-2: #161b22;
-  --line: #273244;
-  --text: #dce3eb;
-  --muted: #8da2b8;
-  --accent: #22c55e;
-  --accent-soft: rgba(34, 197, 94, 0.14);
+  --surface-soft: #161f2c;
+  --text: #f5f7ff;
+  --muted: #a8b3c7;
+  --border: #263244;
+  --accent: #29b6f6;
+  --accent-2: #61ffca;
+  --danger: #ff6b6b;
 }
 
 * {
-  box-sizing: border-box;
+  border-color: var(--border);
 }
 
 html,
 body {
-  margin: 0;
   min-height: 100%;
-  background: radial-gradient(1200px 600px at 20% -20%, #1f2a44 0%, var(--bg) 52%),
-    radial-gradient(900px 500px at 100% 0%, #102e25 0%, var(--bg) 55%), var(--bg);
-  color: var(--text);
 }
 
 body {
-  font-family: var(--font-space-grotesk), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  margin: 0;
+  background:
+    radial-gradient(circle at 20% 15%, rgba(41, 182, 246, 0.18), transparent 30%),
+    radial-gradient(circle at 85% 10%, rgba(97, 255, 202, 0.12), transparent 25%),
+    var(--background);
+  color: var(--text);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
 a {
   color: inherit;
-}
-
-.lemon-cta {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  border-radius: 999px;
-  background: linear-gradient(135deg, #22c55e, #16a34a);
-  color: #04110a;
   text-decoration: none;
-  font-weight: 700;
-  padding: 12px 20px;
-  transition: transform 0.16s ease, box-shadow 0.16s ease;
-  box-shadow: 0 10px 28px rgba(34, 197, 94, 0.24);
 }
 
-.lemon-cta:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 14px 32px rgba(34, 197, 94, 0.3);
+.grid-overlay {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 36px 36px;
+}
+
+.panel {
+  background: linear-gradient(140deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015));
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  backdrop-filter: blur(10px);
+}
+
+.kpi {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(8, 13, 24, 0.78);
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-up {
+  animation: fade-up 0.55s ease-out both;
 }

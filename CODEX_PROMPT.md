@@ -11,24 +11,24 @@ NICHE: ecom-tools
 PRICE: $$29/mo per store, $99/mo for 5 stores/mo
 
 ARCHITECTURE SPEC:
-Next.js SaaS with Shopify webhook integration for cart abandonment events. AI service analyzes cart data and customer behavior to generate personalized email campaigns via email provider API. Dashboard shows A/B test results and conversion metrics.
+Next.js SaaS app with Shopify webhook integration for cart abandonment events. AI service analyzes cart contents and customer data to generate personalized email campaigns via email provider API. Dashboard shows A/B test results and conversion metrics.
 
 PLANNED FILES:
+- app/page.tsx
+- app/dashboard/page.tsx
 - app/api/shopify/webhook/route.ts
 - app/api/shopify/auth/route.ts
 - app/api/ai/generate-email/route.ts
-- app/api/campaigns/route.ts
 - app/api/lemonsqueezy/webhook/route.ts
-- app/dashboard/page.tsx
-- app/onboarding/page.tsx
 - lib/shopify.ts
 - lib/ai-service.ts
 - lib/email-provider.ts
 - lib/database.ts
-- components/campaign-analytics.tsx
-- components/email-preview.tsx
+- components/dashboard/metrics.tsx
+- components/dashboard/email-preview.tsx
+- components/pricing.tsx
 
-DEPENDENCIES: next, tailwindcss, @shopify/shopify-api, openai, @lemonsqueezy/lemonsqueezy.js, resend, prisma, @prisma/client, next-auth, recharts, stripe
+DEPENDENCIES: next, tailwindcss, @shopify/shopify-api, openai, prisma, @prisma/client, resend, lemonsqueezy.js, stripe, react-hook-form, recharts, lucide-react
 
 REQUIREMENTS:
 - Next.js 15 with App Router (app/ directory)

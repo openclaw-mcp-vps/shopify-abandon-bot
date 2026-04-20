@@ -1,8 +1,11 @@
-node_modules
-.next
-out
+/node_modules
+/.next
+/out
+/data/*.db
+/data/*.db-*
 .env
 .DS_Store
 npm-debug.log*
-coverage
-*.tsbuildinfo
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

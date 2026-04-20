@@ -1,123 +1,138 @@
-import { createHash } from "crypto";
+import { NextRequest, NextResponse } from "next/server";
 
-import { NextResponse } from "next/server";
+import { generatePersonalizedEmailVariants } from "@/lib/ai-service";
+import {
+  createOrUpdateCart,
+  hasSentEmailForCart,
+  markEmailSent,
+  recordRecoveredOrder,
+  saveGeneratedEmailVariant
+} from "@/lib/database";
+import { sendRecoveryEmail } from "@/lib/email-provider";
+import {
+  chooseVariant,
+  isAbandonmentTopic,
+  isOrderTopic,
+  normalizeAbandonedCartPayload,
+  normalizeOrderPayload,
+  verifyShopifyWebhookSignature
+} from "@/lib/shopify";
 
-import { generateEmailVariants } from "@/lib/ai-service";
-import { createCampaign, findCampaignByCheckoutId, getStoreByDomain, recordWebhookEvent, updateCampaign } from "@/lib/database";
-import { sendCampaignEmail } from "@/lib/email-provider";
-import { mapShopifyCheckout, verifyShopifyWebhook } from "@/lib/shopify";
-import type { ShopifyCheckoutPayload } from "@/lib/shopify";
-import type { CampaignVariantId } from "@/lib/types";
-
-function pickVariant(customerEmail: string): CampaignVariantId {
-  const hash = createHash("sha256").update(customerEmail).digest("hex");
-  const last = parseInt(hash.slice(-1), 16);
-  return last % 2 === 0 ? "A" : "B";
-}
-
-export async function POST(request: Request): Promise<NextResponse> {
+export async function POST(request: NextRequest) {
   const rawBody = await request.text();
   const signature = request.headers.get("x-shopify-hmac-sha256");
-  const topic = request.headers.get("x-shopify-topic") || "unknown";
-  const storeDomain = request.headers.get("x-shopify-shop-domain") || "";
 
-  if (!verifyShopifyWebhook(rawBody, signature)) {
-    return NextResponse.json({ error: "Invalid Shopify webhook signature" }, { status: 401 });
+  if (!verifyShopifyWebhookSignature(rawBody, signature)) {
+    return NextResponse.json({ error: "Invalid Shopify webhook signature." }, { status: 401 });
   }
 
-  await recordWebhookEvent({
-    source: "shopify",
-    topic,
-    rawPayload: rawBody
+  let payload: Record<string, unknown>;
+
+  try {
+    payload = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON payload." }, { status: 400 });
+  }
+
+  const topic = request.headers.get("x-shopify-topic") ?? "";
+  const shopDomain = request.headers.get("x-shopify-shop-domain") ?? "unknown-shop.myshopify.com";
+
+  if (isOrderTopic(topic)) {
+    const order = normalizeOrderPayload(payload);
+
+    if (!order) {
+      return NextResponse.json({ status: "ignored", reason: "missing cart token in order payload" });
+    }
+
+    const recorded = recordRecoveredOrder({
+      shopDomain,
+      cartToken: order.cartToken,
+      orderValue: order.orderValue
+    });
+
+    return NextResponse.json({
+      status: recorded ? "conversion_recorded" : "conversion_unmatched",
+      cartToken: order.cartToken
+    });
+  }
+
+  if (!isAbandonmentTopic(topic)) {
+    return NextResponse.json({ status: "ignored", topic });
+  }
+
+  const abandonedCart = normalizeAbandonedCartPayload(payload, shopDomain);
+
+  if (!abandonedCart) {
+    return NextResponse.json({ status: "ignored", reason: "payload is not an abandoned checkout" });
+  }
+
+  const cartResult = createOrUpdateCart({
+    shopDomain,
+    cartToken: abandonedCart.cartToken,
+    customerEmail: abandonedCart.customerEmail,
+    customerName: abandonedCart.customerName,
+    totalPrice: abandonedCart.totalPrice,
+    currency: abandonedCart.currency,
+    items: abandonedCart.items,
+    browseHistory: abandonedCart.browseHistory
   });
 
-  if (!storeDomain) {
-    return NextResponse.json({ error: "Missing x-shopify-shop-domain header" }, { status: 400 });
+  if (!cartResult.isNew && hasSentEmailForCart(cartResult.cartId)) {
+    return NextResponse.json({
+      status: "ignored",
+      reason: "email already sent for this cart",
+      cartId: cartResult.cartId
+    });
   }
 
-  const store = await getStoreByDomain(storeDomain);
-  if (!store) {
-    return NextResponse.json(
-      {
-        error: `Store ${storeDomain} is not connected yet`
-      },
-      { status: 404 }
-    );
-  }
-
-  const payload = JSON.parse(rawBody) as ShopifyCheckoutPayload;
-  const checkout = mapShopifyCheckout(payload);
-
-  if (!checkout.isAbandoned) {
-    return NextResponse.json({ ok: true, skipped: "Checkout already completed" });
-  }
-
-  if (!checkout.customerEmail || !checkout.recoveryUrl) {
-    return NextResponse.json({ ok: true, skipped: "Missing customer email or recovery URL" });
-  }
-
-  const duplicate = await findCampaignByCheckoutId(checkout.checkoutId);
-  if (duplicate) {
-    return NextResponse.json({ ok: true, skipped: "Campaign already exists", campaignId: duplicate.id });
-  }
-
-  const variants = await generateEmailVariants({
-    storeDomain: store.storeDomain,
-    customerFirstName: checkout.customerFirstName,
-    cartItems: checkout.cartItems,
-    browsingSignals: checkout.browsingSignals,
-    cartValue: checkout.cartValue,
-    recoveryUrl: checkout.recoveryUrl
+  const generated = await generatePersonalizedEmailVariants({
+    customerName: abandonedCart.customerName,
+    customerEmail: abandonedCart.customerEmail,
+    shopDomain,
+    discountCode: abandonedCart.discountCode,
+    cartItems: abandonedCart.items,
+    browseHistory: abandonedCart.browseHistory
   });
 
-  const assignedVariant = pickVariant(checkout.customerEmail);
-
-  const campaign = await createCampaign({
-    storeDomain: store.storeDomain,
-    checkoutId: checkout.checkoutId,
-    customerEmail: checkout.customerEmail,
-    customerFirstName: checkout.customerFirstName,
-    cartItems: checkout.cartItems,
-    browsingSignals: checkout.browsingSignals,
-    cartValue: checkout.cartValue,
-    recoveryUrl: checkout.recoveryUrl,
-    variants,
-    assignedVariant,
-    status: "queued",
-    generatedAt: new Date().toISOString(),
-    recoveredRevenue: 0
+  const variantAId = saveGeneratedEmailVariant({
+    cartId: cartResult.cartId,
+    variant: "A",
+    subject: generated.variantA.subject,
+    body: generated.variantA.body
   });
 
-  const emailResult = await sendCampaignEmail(campaign);
+  const variantBId = saveGeneratedEmailVariant({
+    cartId: cartResult.cartId,
+    variant: "B",
+    subject: generated.variantB.subject,
+    body: generated.variantB.body
+  });
 
-  if (!emailResult.success) {
-    await updateCampaign(campaign.id, (current) => ({
-      ...current,
-      status: "failed",
-      failureReason: emailResult.error
-    }));
+  const selectedVariant = chooseVariant(abandonedCart.cartToken);
+  const selectedVariantId = selectedVariant === "A" ? variantAId : variantBId;
+  const selectedEmail = selectedVariant === "A" ? generated.variantA : generated.variantB;
 
-    return NextResponse.json(
-      {
-        error: "Failed to send campaign email",
-        details: emailResult.error,
-        campaignId: campaign.id
-      },
-      { status: 500 }
-    );
-  }
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? request.nextUrl.origin;
+  const trackingPixelUrl = `${baseUrl}/api/email/track/open?id=${selectedVariantId}`;
+  const trackedCheckoutUrl = `${baseUrl}/api/email/track/click?id=${selectedVariantId}&to=${encodeURIComponent(abandonedCart.checkoutUrl)}`;
 
-  await updateCampaign(campaign.id, (current) => ({
-    ...current,
-    status: "sent",
-    providerMessageId: emailResult.messageId,
-    sentAt: new Date().toISOString()
-  }));
+  const delivery = await sendRecoveryEmail({
+    to: abandonedCart.customerEmail,
+    subject: selectedEmail.subject,
+    body: selectedEmail.body,
+    customerName: abandonedCart.customerName,
+    shopDomain,
+    ctaUrl: trackedCheckoutUrl,
+    pixelUrl: trackingPixelUrl,
+    variant: selectedVariant
+  });
+
+  markEmailSent(selectedVariantId, delivery.messageId);
 
   return NextResponse.json({
-    ok: true,
-    campaignId: campaign.id,
-    variant: assignedVariant,
-    providerMessageId: emailResult.messageId
+    status: "sent",
+    cartId: cartResult.cartId,
+    variant: selectedVariant,
+    simulatedDelivery: delivery.simulated
   });
 }

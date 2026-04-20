@@ -1,258 +1,219 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
-import Script from "next/script";
-import { CheckCircle2, CreditCard, Loader2, ShieldCheck, Sparkles } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useForm } from "react-hook-form";
+import { Check, CreditCard, LoaderCircle, Lock, Sparkles } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+type ClaimFormValues = {
+  email: string;
+};
 
-type Plan = "starter" | "agency";
-
-const PLAN_COPY: Record<
-  Plan,
-  {
-    title: string;
-    price: string;
-    description: string;
-    bullets: string[];
+declare global {
+  interface Window {
+    LemonSqueezy?: {
+      Url?: {
+        Open: (url: string) => void;
+      };
+    };
   }
-> = {
-  starter: {
-    title: "Starter",
+}
+
+const plans = [
+  {
+    name: "Starter",
     price: "$29/mo",
-    description: "One Shopify store with automated AI cart-recovery flows.",
+    description: "For one Shopify store with auto-send A/B emails and recovery analytics.",
     bullets: [
       "1 connected Shopify store",
-      "AI-generated subject + body variants",
-      "Automatic A/B split and conversion tracking",
-      "Recovery dashboard + webhook processing",
-    ],
+      "AI subject/body generation from cart + browsing signals",
+      "Automatic A/B split and send orchestration",
+      "Live recovery funnel dashboard"
+    ]
   },
-  agency: {
-    title: "Agency",
+  {
+    name: "Growth",
     price: "$99/mo",
-    description: "Manage up to five stores with one account and shared analytics.",
+    description: "For agency operators and multi-brand owners.",
     bullets: [
       "Up to 5 connected stores",
-      "Cross-store performance leaderboard",
-      "Priority webhook retries and support",
-      "Everything in Starter",
-    ],
-  },
-};
+      "Cross-store performance benchmarking",
+      "Priority webhook support",
+      "Team-friendly KPI exports"
+    ]
+  }
+] as const;
 
-type PricingProps = {
-  className?: string;
-  heading?: string;
-  subheading?: string;
-};
+function buildCheckoutUrl(rawProductId: string | undefined) {
+  if (!rawProductId) {
+    return null;
+  }
 
-export function Pricing({ className, heading, subheading }: PricingProps): React.JSX.Element {
-  const [email, setEmail] = useState("");
-  const [loadingPlan, setLoadingPlan] = useState<Plan | null>(null);
-  const [message, setMessage] = useState<string>("");
+  if (rawProductId.startsWith("http://") || rawProductId.startsWith("https://")) {
+    return rawProductId;
+  }
 
-  const lemonsqueezyProductId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID;
+  return `https://checkout.lemonsqueezy.com/buy/${rawProductId}`;
+}
 
-  const verifyAccess = useCallback(async () => {
-    const response = await fetch("/api/paywall/status", {
-      method: "GET",
-      cache: "no-store",
-    });
+export function Pricing() {
+  const router = useRouter();
+  const [claimState, setClaimState] = useState<"idle" | "success" | "error">("idle");
+  const [claimMessage, setClaimMessage] = useState<string>("");
 
-    if (!response.ok) {
+  const checkoutUrl = useMemo(
+    () => buildCheckoutUrl(process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID),
+    []
+  );
+
+  const { register, handleSubmit, formState } = useForm<ClaimFormValues>({
+    defaultValues: {
+      email: ""
+    }
+  });
+
+  useEffect(() => {
+    const scriptId = "lemonsqueezy-overlay-script";
+
+    if (document.getElementById(scriptId)) {
       return;
     }
 
-    const payload = (await response.json()) as { active?: boolean };
-    if (payload.active) {
-      window.location.assign("/dashboard");
-    }
+    const script = document.createElement("script");
+    script.id = scriptId;
+    script.src = "https://app.lemonsqueezy.com/js/lemon.js";
+    script.defer = true;
+
+    document.body.appendChild(script);
+
+    return () => {
+      script.remove();
+    };
   }, []);
 
-  const initLemon = useCallback(() => {
-    if (!window.LemonSqueezy) {
+  const openCheckout = () => {
+    if (!checkoutUrl) {
+      setClaimState("error");
+      setClaimMessage(
+        "Set NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID with a checkout URL or product checkout ID to open the payment overlay."
+      );
       return;
     }
 
-    window.createLemonSqueezy?.();
-    window.LemonSqueezy.Setup({
-      eventHandler: (event) => {
-        if (event.event === "Checkout.Success") {
-          verifyAccess().catch(() => undefined);
-        }
+    if (window.LemonSqueezy?.Url?.Open) {
+      window.LemonSqueezy.Url.Open(checkoutUrl);
+      return;
+    }
+
+    window.open(checkoutUrl, "_blank", "noopener,noreferrer");
+  };
+
+  const onClaim = handleSubmit(async (values) => {
+    setClaimState("idle");
+    setClaimMessage("");
+
+    const response = await fetch("/api/paywall/claim", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
       },
+      body: JSON.stringify({ email: values.email })
     });
-  }, [verifyAccess]);
 
-  const openCheckout = useCallback(
-    (checkoutUrl: string) => {
-      initLemon();
+    const data = (await response.json()) as { error?: string; help?: string; status?: string };
 
-      if (window.LemonSqueezy?.Url?.Open) {
-        window.LemonSqueezy.Url.Open(checkoutUrl);
-        return;
-      }
+    if (!response.ok) {
+      setClaimState("error");
+      setClaimMessage(data.help ?? data.error ?? "Unable to unlock access with that billing email.");
+      return;
+    }
 
-      window.location.assign(checkoutUrl);
-    },
-    [initLemon],
-  );
-
-  const startCheckout = useCallback(
-    async (plan: Plan) => {
-      setMessage("");
-
-      if (!email || !email.includes("@")) {
-        setMessage("Enter a valid work email so we can tie your purchase to dashboard access.");
-        return;
-      }
-
-      if (!lemonsqueezyProductId) {
-        setMessage("Set NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID before launching checkout.");
-        return;
-      }
-
-      setLoadingPlan(plan);
-
-      try {
-        const response = await fetch("/api/lemonsqueezy/checkout-url", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            email,
-            plan,
-          }),
-        });
-
-        const payload = (await response.json()) as {
-          checkoutUrl?: string;
-          error?: string;
-        };
-
-        if (!response.ok || !payload.checkoutUrl) {
-          setMessage(payload.error ?? "Unable to create checkout session.");
-          return;
-        }
-
-        openCheckout(payload.checkoutUrl);
-        setMessage("Checkout opened. After payment, access unlocks automatically.");
-      } catch {
-        setMessage("Could not start Lemon Squeezy checkout. Please retry.");
-      } finally {
-        setLoadingPlan(null);
-      }
-    },
-    [email, lemonsqueezyProductId, openCheckout],
-  );
-
-  const renderedPlans = useMemo(
-    () =>
-      (Object.keys(PLAN_COPY) as Plan[]).map((plan) => {
-        const copy = PLAN_COPY[plan];
-
-        return (
-          <Card key={plan} className="relative overflow-hidden">
-            {plan === "starter" ? (
-              <div className="absolute right-3 top-3">
-                <Badge>Most Popular</Badge>
-              </div>
-            ) : null}
-            <CardHeader>
-              <CardTitle className="text-2xl">{copy.title}</CardTitle>
-              <CardDescription>{copy.description}</CardDescription>
-              <div className="mt-4 flex items-end gap-2">
-                <span className="text-4xl font-bold text-[#f0f6fc]">{copy.price}</span>
-                <span className="mb-1 text-sm text-[#8b949e]">cancel anytime</span>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <ul className="space-y-2 text-sm text-[#d0d7de]">
-                {copy.bullets.map((bullet) => (
-                  <li key={bullet} className="flex items-start gap-2">
-                    <CheckCircle2 className="mt-0.5 h-4 w-4 text-[#3fb950]" />
-                    <span>{bullet}</span>
-                  </li>
-                ))}
-              </ul>
-
-              <Button
-                className="mt-6 w-full"
-                size="lg"
-                onClick={() => startCheckout(plan)}
-                disabled={loadingPlan !== null}
-              >
-                {loadingPlan === plan ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Opening checkout
-                  </>
-                ) : (
-                  <>
-                    <CreditCard className="mr-2 h-4 w-4" />
-                    Start {copy.title}
-                  </>
-                )}
-              </Button>
-            </CardContent>
-          </Card>
-        );
-      }),
-    [loadingPlan, startCheckout],
-  );
+    setClaimState("success");
+    setClaimMessage("Access unlocked. Redirecting to your recovery dashboard...");
+    router.push("/dashboard");
+    router.refresh();
+  });
 
   return (
-    <section className={className} id="pricing">
-      <Script
-        src="https://assets.lemonsqueezy.com/lemon.js"
-        strategy="afterInteractive"
-        onLoad={initLemon}
-      />
-
-      <div className="mx-auto max-w-5xl">
-        <div className="mb-8 space-y-4 text-center">
-          <Badge variant="muted" className="mx-auto">
-            <Sparkles className="mr-1 h-3.5 w-3.5" />
-            Paid plans include full recovery automation
-          </Badge>
-          <h2 className="text-3xl font-bold md:text-4xl">
-            {heading ?? "Pricing that pays for itself in recovered revenue"}
-          </h2>
-          <p className="mx-auto max-w-2xl text-[#8b949e]">
-            {subheading ??
-              "Typical Shopify abandoned-cart templates convert around 10%. Stores using AI-personalized copy see 28-32%, and that lift usually covers the subscription in days."}
-          </p>
+    <section id="pricing" className="space-y-6">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="text-xs uppercase tracking-[0.16em] text-[#8ea2c8]">Pricing</p>
+          <h2 className="mt-2 text-3xl font-semibold text-white">Capture lost revenue before it leaks every day</h2>
         </div>
+        <button
+          type="button"
+          onClick={openCheckout}
+          className="inline-flex items-center gap-2 rounded-xl border border-[#2b3e59] bg-[#0f1f34] px-4 py-2 text-sm font-semibold text-[#d9ecff] transition hover:border-[#3f5d84] hover:bg-[#143158]"
+        >
+          <CreditCard size={16} />
+          Start checkout
+        </button>
+      </div>
 
-        <Card className="mb-8 border-[#2ea043]/35 bg-[#0f141d]">
-          <CardContent className="pt-6">
-            <label htmlFor="checkout-email" className="mb-2 block text-sm font-medium text-[#d0d7de]">
-              Work email for billing and dashboard access
-            </label>
-            <div className="flex flex-col gap-3 sm:flex-row">
-              <input
-                id="checkout-email"
-                type="email"
-                autoComplete="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                placeholder="owner@yourstore.com"
-                className="h-11 w-full rounded-lg border border-[#30363d] bg-[#151b23] px-3 text-sm text-[#f0f6fc] outline-none transition focus:border-[#3fb950]"
-              />
-              <Button variant="outline" className="h-11 min-w-44" onClick={() => verifyAccess()}>
-                <ShieldCheck className="mr-2 h-4 w-4" />
-                Refresh Access
-              </Button>
+      <div className="grid gap-5 md:grid-cols-2">
+        {plans.map((plan) => (
+          <article key={plan.name} className="panel p-6">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-xl font-semibold text-white">{plan.name}</h3>
+              <span className="rounded-full bg-[#102a47] px-3 py-1 text-xs font-semibold text-[#8ad1ff]">
+                {plan.price}
+              </span>
             </div>
-            {message ? <p className="mt-3 text-sm text-[#8b949e]">{message}</p> : null}
-          </CardContent>
-        </Card>
+            <p className="mt-3 text-sm text-[#aab8d1]">{plan.description}</p>
+            <ul className="mt-5 space-y-2 text-sm text-[#d4deee]">
+              {plan.bullets.map((bullet) => (
+                <li key={bullet} className="flex items-start gap-2">
+                  <Check size={16} className="mt-0.5 text-[#61ffca]" />
+                  <span>{bullet}</span>
+                </li>
+              ))}
+            </ul>
+            <button
+              type="button"
+              onClick={openCheckout}
+              className="mt-6 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#29b6f6] to-[#61ffca] px-4 py-2.5 text-sm font-semibold text-[#04121d] transition hover:opacity-90"
+            >
+              <Sparkles size={16} />
+              Subscribe with Lemon Squeezy
+            </button>
+          </article>
+        ))}
+      </div>
 
-        <div className="grid gap-5 md:grid-cols-2">{renderedPlans}</div>
+      <div className="panel p-5">
+        <div className="flex items-center gap-2 text-white">
+          <Lock size={16} className="text-[#61ffca]" />
+          <h3 className="font-semibold">Unlock your paid dashboard access</h3>
+        </div>
+        <p className="mt-2 text-sm text-[#9eb1d0]">
+          After checkout, enter the same billing email. We validate the active Lemon Squeezy license and set your
+          secure access cookie.
+        </p>
+
+        <form onSubmit={onClaim} className="mt-4 flex flex-col gap-3 sm:flex-row">
+          <input
+            type="email"
+            placeholder="billing@store.com"
+            autoComplete="email"
+            className="h-11 flex-1 rounded-xl border border-[#2d3e54] bg-[#0b1523] px-3 text-sm text-white placeholder:text-[#6f809b] focus:outline-none focus:ring-2 focus:ring-[#2a88c7]"
+            {...register("email", { required: true })}
+          />
+          <button
+            type="submit"
+            disabled={formState.isSubmitting}
+            className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-[#163a31] px-5 text-sm font-semibold text-[#9ff6d7] transition hover:bg-[#1d4d40] disabled:cursor-not-allowed disabled:opacity-75"
+          >
+            {formState.isSubmitting ? <LoaderCircle size={16} className="animate-spin" /> : null}
+            {formState.isSubmitting ? "Validating" : "Unlock Dashboard"}
+          </button>
+        </form>
+
+        {claimState !== "idle" ? (
+          <p className={`mt-3 text-sm ${claimState === "success" ? "text-[#7ff0c9]" : "text-[#ff9c9c]"}`}>
+            {claimMessage}
+          </p>
+        ) : null}
       </div>
     </section>
   );

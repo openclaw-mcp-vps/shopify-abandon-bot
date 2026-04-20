@@ -1,66 +1,83 @@
+import "server-only";
+
 import { Resend } from "resend";
 
-import type { Campaign } from "@/lib/types";
+export type SendRecoveryEmailInput = {
+  to: string;
+  subject: string;
+  body: string;
+  customerName?: string;
+  shopDomain: string;
+  ctaUrl: string;
+  pixelUrl?: string;
+  variant: "A" | "B";
+};
 
-interface SendResult {
-  success: boolean;
-  messageId?: string;
-  error?: string;
+export type SendRecoveryEmailResult = {
+  messageId: string;
+  simulated: boolean;
+};
+
+const resendClient = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+
+function escapeHtml(input: string) {
+  return input
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
-function buildHtmlBody(campaign: Campaign, bodyText: string, ctaLabel: string): string {
-  const escapedBody = bodyText
-    .split("\n")
-    .map((line) => `<p style=\"margin:0 0 12px 0;line-height:1.6;color:#dce3eb;\">${line}</p>`)
+function renderBodyAsHtml(text: string) {
+  return escapeHtml(text)
+    .split("\n\n")
+    .map((paragraph) => `<p style=\"margin:0 0 14px 0;line-height:1.6;color:#d3d9e8;\">${paragraph.replaceAll("\n", "<br/>")}</p>`)
     .join("");
+}
+
+export function buildRecoveryEmailHtml(input: SendRecoveryEmailInput) {
+  const greetingName = input.customerName?.trim() || "there";
+  const bodyHtml = renderBodyAsHtml(input.body);
 
   return `
-  <div style="background:#0d1117;padding:28px;font-family:Inter,Arial,sans-serif;color:#dce3eb;">
-    <div style="max-width:580px;margin:0 auto;background:#111827;border:1px solid #1f2937;border-radius:14px;padding:28px;">
-      ${escapedBody}
-      <a href="${campaign.recoveryUrl}" style="display:inline-block;margin-top:16px;background:#22c55e;color:#04130b;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:700;">${ctaLabel}</a>
-      <p style="margin:18px 0 0 0;color:#90a4b8;font-size:12px;">Cart value: $${campaign.cartValue.toFixed(2)} • Powered by Shopify Abandon Bot</p>
+    <div style="margin:0;background:#0d1117;padding:24px;font-family:Arial,Helvetica,sans-serif;">
+      <div style="max-width:620px;margin:0 auto;background:#121a27;border:1px solid #263244;border-radius:16px;padding:28px;">
+        <p style="margin:0 0 16px;color:#8ea2c8;font-size:12px;letter-spacing:0.08em;text-transform:uppercase;">Shopify Abandon Bot • Variant ${input.variant}</p>
+        <h1 style="margin:0 0 18px;font-size:24px;line-height:1.2;color:#f5f7ff;">Hi ${escapeHtml(greetingName)}, your cart is still saved.</h1>
+        ${bodyHtml}
+        <p style="margin:24px 0 0;">
+          <a href="${escapeHtml(input.ctaUrl)}" style="display:inline-block;background:linear-gradient(90deg,#29b6f6,#61ffca);color:#06131f;font-weight:700;padding:12px 18px;border-radius:10px;text-decoration:none;">Return To Checkout</a>
+        </p>
+        <p style="margin:20px 0 0;color:#8ea2c8;font-size:12px;">Sent for ${escapeHtml(input.shopDomain)} by Shopify Abandon Bot.</p>
+      </div>
+      ${input.pixelUrl ? `<img src=\"${escapeHtml(input.pixelUrl)}\" width=\"1\" height=\"1\" alt=\"\" style=\"display:block;opacity:0;\"/>` : ""}
     </div>
-  </div>
   `;
 }
 
-export async function sendCampaignEmail(campaign: Campaign): Promise<SendResult> {
-  const variant = campaign.variants.find((item) => item.id === campaign.assignedVariant);
-  if (!variant) {
+export async function sendRecoveryEmail(
+  input: SendRecoveryEmailInput
+): Promise<SendRecoveryEmailResult> {
+  if (!resendClient) {
     return {
-      success: false,
-      error: "Assigned variant missing"
+      messageId: `simulated-${Date.now()}`,
+      simulated: true
     };
   }
 
-  if (!process.env.RESEND_API_KEY) {
-    return {
-      success: true,
-      messageId: `simulated-${Date.now()}`
-    };
-  }
+  const fromAddress = process.env.RESEND_FROM_EMAIL ?? "Shopify Abandon Bot <recovery@updates.example.com>";
 
-  const resend = new Resend(process.env.RESEND_API_KEY);
-  const from = process.env.RESEND_FROM_EMAIL || `Abandon Bot <noreply@${campaign.storeDomain}>`;
+  const response = await resendClient.emails.send({
+    from: fromAddress,
+    to: [input.to],
+    subject: input.subject,
+    html: buildRecoveryEmailHtml(input),
+    text: input.body
+  });
 
-  try {
-    const response = await resend.emails.send({
-      from,
-      to: campaign.customerEmail,
-      subject: variant.subject,
-      text: `${variant.bodyText}\n\n${variant.ctaLabel}: ${campaign.recoveryUrl}`,
-      html: buildHtmlBody(campaign, variant.bodyText, variant.ctaLabel)
-    });
-
-    return {
-      success: true,
-      messageId: response.data?.id
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : "Email provider failure"
-    };
-  }
+  return {
+    messageId: response.data?.id ?? `resend-${Date.now()}`,
+    simulated: false
+  };
 }

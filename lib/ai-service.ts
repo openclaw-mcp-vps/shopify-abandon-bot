@@ -1,118 +1,161 @@
+import "server-only";
+
 import OpenAI from "openai";
 
-import type { BrowsingSignal, CartItem, EmailVariant } from "@/lib/types";
+import type { BrowseEvent, CartItem } from "@/lib/database";
 
-export interface GenerateEmailInput {
-  storeDomain: string;
-  customerFirstName?: string;
+export type EmailVariant = {
+  subject: string;
+  body: string;
+};
+
+export type GeneratedEmailPair = {
+  variantA: EmailVariant;
+  variantB: EmailVariant;
+};
+
+export type EmailGenerationInput = {
+  customerName?: string;
+  customerEmail?: string;
+  shopDomain?: string;
+  discountCode?: string;
   cartItems: CartItem[];
-  browsingSignals: BrowsingSignal[];
-  cartValue: number;
-  recoveryUrl: string;
+  browseHistory: BrowseEvent[];
+};
+
+const openaiClient = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+
+const MODEL_NAME = process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+
+function normalizeLineBreaks(input: string) {
+  return input.replace(/\r\n/g, "\n").trim();
 }
 
-function createFallbackVariants(input: GenerateEmailInput): EmailVariant[] {
-  const firstItem = input.cartItems[0];
-  const firstName = input.customerFirstName?.trim();
-  const greeting = firstName ? `Hi ${firstName},` : "Hi there,";
-  const itemName = firstItem ? firstItem.title : "your items";
+function fallbackGeneration(input: EmailGenerationInput): GeneratedEmailPair {
+  const firstName = input.customerName?.trim() || "there";
+  const cartTotal = input.cartItems
+    .reduce((sum, item) => sum + item.unitPrice * item.quantity, 0)
+    .toFixed(2);
 
-  const variantA: EmailVariant = {
-    id: "A",
-    subject: `${firstName ? `${firstName}, ` : ""}your ${itemName} is still waiting in cart`,
-    bodyText: `${greeting}\n\nYou left ${itemName} in your cart. It looks like you were close to checkout, so we saved your cart and made it one click to finish.\n\nComplete checkout here: ${input.recoveryUrl}\n\nIf you had any questions about sizing, shipping, or fit, reply and we will help right away.`,
-    ctaLabel: "Complete My Checkout"
+  const itemNames = input.cartItems
+    .slice(0, 3)
+    .map((item) => item.title)
+    .join(", ");
+
+  const topBrowseCategory =
+    input.browseHistory.find((entry) => entry.category)?.category ?? "your recently viewed picks";
+
+  const discountLine = input.discountCode
+    ? `Use code ${input.discountCode} at checkout to save before your cart expires.`
+    : "Your cart is still reserved, and checkout only takes about 60 seconds.";
+
+  return {
+    variantA: {
+      subject: `Your ${itemNames || "cart"} is still waiting`,
+      body: normalizeLineBreaks(`Hi ${firstName},
+
+You were close to checking out ${itemNames || "your picks"}, and we kept everything ready for you.
+
+Cart value: $${cartTotal}
+
+${discountLine}
+
+Complete your order now and we will keep this lineup available while inventory lasts.`)
+    },
+    variantB: {
+      subject: `${firstName}, still deciding on ${topBrowseCategory}?`,
+      body: normalizeLineBreaks(`Hi ${firstName},
+
+Based on what you viewed in ${topBrowseCategory}, your cart looks like a strong match.
+
+${itemNames || "The items you selected"} are still available and ready for checkout.
+
+${discountLine}
+
+Finish checkout today to avoid missing your selected sizes and variants.`)
+    }
   };
-
-  const topSignal = input.browsingSignals.sort((a, b) => b.secondsOnPage - a.secondsOnPage)[0];
-  const contextLine = topSignal
-    ? `You spent time on ${topSignal.path}, so this cart appears to be a strong match.`
-    : "This cart was tailored to what you viewed most recently.";
-
-  const variantB: EmailVariant = {
-    id: "B",
-    subject: `Still comparing options? Your cart is saved`,
-    bodyText: `${greeting}\n\n${contextLine}\n\nYour cart total is $${input.cartValue.toFixed(2)} and everything is still reserved for now.\n\nResume checkout: ${input.recoveryUrl}\n\nYou are one step away from placing the order.`,
-    ctaLabel: "Resume Checkout"
-  };
-
-  return [variantA, variantB];
 }
 
-function buildPrompt(input: GenerateEmailInput): string {
-  return [
-    "You are a conversion-focused ecommerce copywriter.",
-    "Generate two abandon-cart email variants for A/B testing.",
-    "Output strict JSON with this shape:",
-    '{"variants":[{"id":"A","subject":"...","bodyText":"...","ctaLabel":"..."},{"id":"B","subject":"...","bodyText":"...","ctaLabel":"..."}] }',
-    "Rules:",
-    "- Keep subject <= 65 characters.",
-    "- Body should be plain text, 90-160 words.",
-    "- Mention concrete products from cart.",
-    "- Reference browsing behavior if available.",
-    "- Never use fake discounts.",
-    "- Tone: helpful, confident, short paragraphs.",
-    "- End with a direct CTA.",
-    "Context:",
-    JSON.stringify(input, null, 2)
-  ].join("\n");
-}
+function safeJsonParse(content: string): GeneratedEmailPair | null {
+  try {
+    const parsed = JSON.parse(content) as Partial<GeneratedEmailPair>;
 
-function getClient(): OpenAI | null {
-  if (!process.env.OPENAI_API_KEY) {
+    if (
+      parsed.variantA?.subject &&
+      parsed.variantA?.body &&
+      parsed.variantB?.subject &&
+      parsed.variantB?.body
+    ) {
+      return {
+        variantA: {
+          subject: normalizeLineBreaks(parsed.variantA.subject).slice(0, 120),
+          body: normalizeLineBreaks(parsed.variantA.body)
+        },
+        variantB: {
+          subject: normalizeLineBreaks(parsed.variantB.subject).slice(0, 120),
+          body: normalizeLineBreaks(parsed.variantB.body)
+        }
+      };
+    }
+
+    return null;
+  } catch {
     return null;
   }
-
-  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 }
 
-export async function generateEmailVariants(input: GenerateEmailInput): Promise<EmailVariant[]> {
-  const fallback = createFallbackVariants(input);
-  const client = getClient();
-
-  if (!client) {
-    return fallback;
+export async function generatePersonalizedEmailVariants(
+  input: EmailGenerationInput
+): Promise<GeneratedEmailPair> {
+  if (!openaiClient) {
+    return fallbackGeneration(input);
   }
 
+  const systemPrompt = [
+    "You are an ecommerce lifecycle marketer specialized in abandoned-cart recovery emails.",
+    "Generate two distinct email variants for A/B testing:",
+    "Variant A: urgent and direct.",
+    "Variant B: consultative and intent-based.",
+    "Both variants must feel human, avoid spammy language, and match the exact cart context.",
+    "Return strict JSON with keys: variantA.subject, variantA.body, variantB.subject, variantB.body.",
+    "Subject <= 70 characters. Body must be 90-180 words and plain text only."
+  ].join(" ");
+
+  const userPrompt = {
+    customerName: input.customerName,
+    customerEmail: input.customerEmail,
+    shopDomain: input.shopDomain,
+    discountCode: input.discountCode,
+    cartItems: input.cartItems,
+    browseHistory: input.browseHistory
+  };
+
   try {
-    const completion = await client.chat.completions.create({
-      model: "gpt-4.1-mini",
-      temperature: 0.8,
+    const completion = await openaiClient.chat.completions.create({
+      model: MODEL_NAME,
       response_format: { type: "json_object" },
+      temperature: 0.8,
       messages: [
-        {
-          role: "system",
-          content: "You create high-converting ecommerce lifecycle emails and respond with valid JSON only."
-        },
+        { role: "system", content: systemPrompt },
         {
           role: "user",
-          content: buildPrompt(input)
+          content: `Generate both variants from this JSON input:\n${JSON.stringify(userPrompt, null, 2)}`
         }
       ]
     });
 
-    const content = completion.choices[0]?.message?.content;
-    if (!content) {
-      return fallback;
+    const raw = completion.choices[0]?.message?.content;
+
+    if (!raw) {
+      return fallbackGeneration(input);
     }
 
-    const parsed = JSON.parse(content) as { variants?: EmailVariant[] };
-
-    if (!parsed.variants || parsed.variants.length < 2) {
-      return fallback;
-    }
-
-    const cleaned = parsed.variants
-      .slice(0, 2)
-      .map((variant, index) => ({
-        id: index === 0 ? "A" : "B",
-        subject: (variant.subject || fallback[index].subject).trim(),
-        bodyText: (variant.bodyText || fallback[index].bodyText).trim(),
-        ctaLabel: (variant.ctaLabel || fallback[index].ctaLabel).trim()
-      })) as EmailVariant[];
-
-    return cleaned;
+    const parsed = safeJsonParse(raw);
+    return parsed ?? fallbackGeneration(input);
   } catch {
-    return fallback;
+    return fallbackGeneration(input);
   }
 }

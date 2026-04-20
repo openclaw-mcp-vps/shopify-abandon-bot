@@ -1,96 +1,96 @@
-import { createHmac, timingSafeEqual } from "crypto";
+import crypto from "node:crypto";
 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-import { recordPayment, recordWebhookEvent } from "@/lib/database";
+import { recordLemonPurchase } from "@/lib/database";
 
-function verifySignature(rawBody: string, signature: string | null): boolean {
+function verifyLemonSqueezySignature(rawBody: string, signatureHeader: string | null) {
   const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
-  if (!secret || !signature) {
+
+  if (!secret || !signatureHeader) {
     return false;
   }
 
-  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
-  const normalized = signature.replace(/^sha256=/i, "");
-  const signatureBuffer = Buffer.from(normalized, "utf8");
-  const expectedBuffer = Buffer.from(expected, "utf8");
+  const digest = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
+  const digestBase64 = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("base64");
 
-  if (signatureBuffer.length !== expectedBuffer.length) {
+  if (signatureHeader === digest || signatureHeader === digestBase64) {
+    return true;
+  }
+
+  const providedBuffer = Buffer.from(signatureHeader, "utf8");
+  const digestBuffer = Buffer.from(digest, "utf8");
+
+  if (providedBuffer.length !== digestBuffer.length) {
     return false;
   }
 
-  return timingSafeEqual(signatureBuffer, expectedBuffer);
+  return crypto.timingSafeEqual(providedBuffer, digestBuffer);
 }
 
-function inferPlan(productName: string): { plan: "starter" | "growth"; storeLimit: number } {
-  const lower = productName.toLowerCase();
-
-  if (lower.includes("5 stores") || lower.includes("growth") || lower.includes("99")) {
-    return { plan: "growth", storeLimit: 5 };
-  }
-
-  return { plan: "starter", storeLimit: 1 };
-}
-
-export async function POST(request: Request): Promise<NextResponse> {
+export async function POST(request: NextRequest) {
   const rawBody = await request.text();
-  const signature = request.headers.get("x-signature");
+  const signatureHeader = request.headers.get("x-signature") ?? request.headers.get("x-lemonsqueezy-signature");
 
-  if (!verifySignature(rawBody, signature)) {
-    return NextResponse.json({ error: "Invalid webhook signature" }, { status: 401 });
+  if (!verifyLemonSqueezySignature(rawBody, signatureHeader)) {
+    return NextResponse.json({ error: "Invalid Lemon Squeezy webhook signature." }, { status: 401 });
   }
 
-  await recordWebhookEvent({
-    source: "lemonsqueezy",
-    topic: request.headers.get("x-event-name") || "unknown",
-    rawPayload: rawBody
-  });
-
-  const payload = JSON.parse(rawBody) as {
-    meta?: { event_name?: string };
-    data?: {
-      id?: string;
-      attributes?: {
-        identifier?: string;
-        user_email?: string;
-        customer_email?: string;
-        first_order_item?: {
-          product_name?: string;
-          variant_name?: string;
-        };
-      };
-    };
-  };
-
-  const eventName = payload.meta?.event_name || "";
-  const allowedEvents = new Set([
-    "order_created",
-    "subscription_created",
-    "subscription_payment_success",
-    "subscription_payment_recovered"
-  ]);
-
-  if (!allowedEvents.has(eventName)) {
-    return NextResponse.json({ ok: true, skipped: true });
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON payload." }, { status: 400 });
   }
 
-  const attributes = payload.data?.attributes;
-  const productName = attributes?.first_order_item?.product_name || attributes?.first_order_item?.variant_name || "starter";
-  const { plan, storeLimit } = inferPlan(productName);
+  const meta = payload.meta as Record<string, unknown> | undefined;
+  const data = payload.data as Record<string, unknown> | undefined;
+  const attributes = data?.attributes as Record<string, unknown> | undefined;
 
-  const orderId = attributes?.identifier || payload.data?.id;
-  const email = attributes?.user_email || attributes?.customer_email;
+  const eventName = (meta?.event_name as string | undefined) ?? "unknown";
 
-  if (!orderId || !email) {
-    return NextResponse.json({ error: "Missing order identifier or email" }, { status: 400 });
+  const email =
+    (attributes?.user_email as string | undefined) ??
+    (attributes?.customer_email as string | undefined) ??
+    (attributes?.email as string | undefined);
+
+  if (!email) {
+    return NextResponse.json({ status: "ignored", reason: "No customer email on payload", eventName });
   }
 
-  const payment = await recordPayment({
-    orderId,
+  const orderId =
+    (data?.id ? String(data.id) : undefined) ??
+    (attributes?.order_id ? String(attributes.order_id) : undefined);
+
+  const planName =
+    (attributes?.variant_name as string | undefined) ?? (attributes?.product_name as string | undefined);
+
+  let status: "active" | "cancelled" | "refunded" = "active";
+
+  if (eventName.includes("refund") || eventName.includes("refunded")) {
+    status = "refunded";
+  }
+
+  if (
+    eventName.includes("cancel") ||
+    eventName.includes("expired") ||
+    eventName.includes("paused") ||
+    eventName.includes("subscription_cancelled")
+  ) {
+    status = "cancelled";
+  }
+
+  recordLemonPurchase({
     email,
-    plan,
-    storeLimit
+    orderId,
+    status,
+    planName
   });
 
-  return NextResponse.json({ ok: true, paymentId: payment.id });
+  return NextResponse.json({
+    status: "processed",
+    eventName,
+    email,
+    recordedStatus: status
+  });
 }
