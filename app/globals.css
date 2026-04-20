@@ -1,0 +1,58 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --font-sans: var(--font-space-grotesk);
+  --font-mono: var(--font-plex-mono);
+  --font-heading: var(--font-space-grotesk);
+}
+
+:root {
+  --background: #0d1117;
+  --foreground: #e6edf3;
+  --card: #111827;
+  --card-foreground: #e5e7eb;
+  --primary: #34d399;
+  --primary-foreground: #0b1220;
+  --secondary: #1f2937;
+  --secondary-foreground: #e5e7eb;
+  --muted: #111827;
+  --muted-foreground: #9ca3af;
+  --border: #243142;
+  --ring: #34d399;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body {
+    @apply min-h-full;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    background-image:
+      radial-gradient(circle at 10% -10%, rgba(52, 211, 153, 0.12), transparent 42%),
+      radial-gradient(circle at 100% 0%, rgba(14, 165, 233, 0.1), transparent 36%);
+    font-feature-settings: "cv11", "ss01", "ss03";
+  }
+
+  a {
+    @apply transition-colors;
+  }
+}
