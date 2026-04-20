@@ -2,6 +2,7 @@ node_modules
 .next
 out
 .env
-.env.local
 .DS_Store
-data/database.json
+npm-debug.log*
+coverage
+*.tsbuildinfo

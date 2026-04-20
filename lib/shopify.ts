@@ -1,267 +1,152 @@
-import "server-only";
+import { createHmac, timingSafeEqual } from "crypto";
 
-import "@shopify/shopify-api/adapters/node";
+import { ApiVersion } from "@shopify/shopify-api";
 
-import { createHmac, timingSafeEqual } from "node:crypto";
+import type { BrowsingSignal, CartItem } from "@/lib/types";
 
-import type { CartItem } from "@/lib/database";
+interface ShopifyLineItem {
+  product_id?: number;
+  variant_id?: number;
+  title: string;
+  variant_title?: string;
+  quantity: number;
+  price: string;
+  image_url?: string;
+  url?: string;
+}
 
-export const SHOPIFY_API_VERSION = "2025-10";
+interface ShopifyCustomer {
+  first_name?: string;
+  last_name?: string;
+  email?: string;
+}
 
-export type ParsedAbandonmentPayload = {
-  shopDomain: string;
-  cartToken: string;
-  email: string;
-  customerName: string;
+interface ShopifyNoteAttribute {
+  name: string;
+  value: string;
+}
+
+export interface ShopifyCheckoutPayload {
+  id: number | string;
+  abandoned_checkout_url?: string;
+  email?: string;
+  customer?: ShopifyCustomer;
+  line_items: ShopifyLineItem[];
+  total_price: string;
   currency: string;
-  subtotal: number;
-  checkoutUrl: string;
-  items: CartItem[];
-  browsingSignals: string[];
-};
-
-function env(name: string): string {
-  return process.env[name] ?? "";
+  completed_at?: string | null;
+  note_attributes?: ShopifyNoteAttribute[];
 }
 
-export function isValidShopDomain(shop: string): boolean {
-  return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(shop);
+export function normalizeShopDomain(input: string): string {
+  const normalized = input
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/$/, "");
+
+  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(normalized)) {
+    throw new Error("Store domain must be a valid *.myshopify.com domain");
+  }
+
+  return normalized;
 }
 
-export function buildShopifyInstallUrl(shop: string, state: string): string {
-  const apiKey = env("SHOPIFY_API_KEY");
-  const scopes = env("SHOPIFY_SCOPES") || "read_orders,read_customers,read_checkouts";
-  const appUrl = env("NEXT_PUBLIC_APP_URL") || "http://localhost:3000";
-  const redirectUri = `${appUrl}/api/shopify/install`;
-
-  const params = new URLSearchParams({
-    client_id: apiKey,
-    scope: scopes,
-    redirect_uri: redirectUri,
-    state,
-  });
-
-  return `https://${shop}/admin/oauth/authorize?${params.toString()}`;
-}
-
-export function verifyShopifyInstallHmac(params: URLSearchParams): boolean {
-  const secret = env("SHOPIFY_API_SECRET");
-  const hmac = params.get("hmac");
-
-  if (!secret || !hmac) {
+export function verifyShopifyWebhook(rawBody: string, signature: string | null): boolean {
+  const secret = process.env.SHOPIFY_API_SECRET;
+  if (!secret || !signature) {
     return false;
   }
 
-  const sanitized = [...params.entries()]
-    .filter(([key]) => key !== "hmac" && key !== "signature")
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, value]) => `${key}=${value}`)
-    .join("&");
+  const computed = createHmac("sha256", secret).update(rawBody, "utf8").digest("base64");
 
-  const digest = createHmac("sha256", secret).update(sanitized).digest("hex");
+  const signatureBuffer = Buffer.from(signature);
+  const computedBuffer = Buffer.from(computed);
 
-  const digestBuffer = Buffer.from(digest, "utf8");
-  const hmacBuffer = Buffer.from(hmac, "utf8");
-
-  if (digestBuffer.length !== hmacBuffer.length) {
+  if (signatureBuffer.length !== computedBuffer.length) {
     return false;
   }
 
-  return timingSafeEqual(digestBuffer, hmacBuffer);
+  return timingSafeEqual(signatureBuffer, computedBuffer);
 }
 
-export async function exchangeShopifyCodeForToken(input: {
-  shop: string;
-  code: string;
-}): Promise<{ accessToken: string; scope: string } | null> {
-  const apiKey = env("SHOPIFY_API_KEY");
-  const apiSecret = env("SHOPIFY_API_SECRET");
+export async function validateShopifyToken(storeDomain: string, accessToken: string): Promise<boolean> {
+  const apiVersion = ApiVersion.April26;
 
-  if (!apiKey || !apiSecret) {
-    return null;
-  }
-
-  const response = await fetch(
-    `https://${input.shop}/admin/oauth/access_token`,
-    {
-      method: "POST",
+  try {
+    const response = await fetch(`https://${storeDomain}/admin/api/${apiVersion}/shop.json`, {
+      method: "GET",
       headers: {
-        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": accessToken,
+        "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        client_id: apiKey,
-        client_secret: apiSecret,
-        code: input.code,
-      }),
-    },
-  );
+      cache: "no-store"
+    });
 
-  if (!response.ok) {
-    return null;
-  }
-
-  const data = (await response.json()) as {
-    access_token?: string;
-    scope?: string;
-  };
-
-  if (!data.access_token) {
-    return null;
-  }
-
-  return {
-    accessToken: data.access_token,
-    scope: data.scope ?? env("SHOPIFY_SCOPES"),
-  };
-}
-
-export function verifyShopifyWebhook(input: {
-  rawBody: string;
-  hmacHeader: string | null;
-}): boolean {
-  const secret = env("SHOPIFY_WEBHOOK_SECRET") || env("SHOPIFY_API_SECRET");
-
-  if (!secret || !input.hmacHeader) {
+    return response.ok;
+  } catch {
     return false;
   }
-
-  const generated = createHmac("sha256", secret)
-    .update(input.rawBody, "utf8")
-    .digest("base64");
-
-  const generatedBuffer = Buffer.from(generated, "utf8");
-  const headerBuffer = Buffer.from(input.hmacHeader, "utf8");
-
-  if (generatedBuffer.length !== headerBuffer.length) {
-    return false;
-  }
-
-  return timingSafeEqual(generatedBuffer, headerBuffer);
 }
 
-function numberFromUnknown(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-
-  return 0;
-}
-
-function parseCartItems(payload: Record<string, unknown>): CartItem[] {
-  const source = payload.line_items;
-
-  if (!Array.isArray(source)) {
+function parseBrowsingSignals(noteAttributes?: ShopifyNoteAttribute[]): BrowsingSignal[] {
+  if (!noteAttributes || noteAttributes.length === 0) {
     return [];
   }
 
-  return source
-    .map((item) => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
+  const signalAttribute = noteAttributes.find((attribute) => attribute.name === "browsing_signals");
+  if (!signalAttribute) {
+    return [];
+  }
 
-      const typed = item as Record<string, unknown>;
-      const title = String(typed.title ?? "Untitled product").trim();
-      const quantity = numberFromUnknown(typed.quantity) || 1;
-      const price = numberFromUnknown(typed.price);
-      const variantTitle = String(typed.variant_title ?? "").trim() || undefined;
-
-      return {
-        title,
-        quantity,
-        price,
-        variantTitle,
-      } satisfies CartItem;
-    })
-    .filter(Boolean) as CartItem[];
+  try {
+    const parsed = JSON.parse(signalAttribute.value) as BrowsingSignal[];
+    return parsed.slice(0, 10).map((signal) => ({
+      path: signal.path,
+      secondsOnPage: Number(signal.secondsOnPage) || 0,
+      referrer: signal.referrer,
+      viewedAt: signal.viewedAt
+    }));
+  } catch {
+    return [];
+  }
 }
 
-export function parseAbandonmentPayload(input: {
-  payload: Record<string, unknown>;
-  shopDomain: string;
-}): ParsedAbandonmentPayload | null {
-  const payload = input.payload;
-  const items = parseCartItems(payload);
-  const email = String(payload.email ?? "").trim().toLowerCase();
-  const subtotal = numberFromUnknown(payload.subtotal_price);
-  const completedAt = payload.completed_at;
-
-  if (!email || items.length === 0 || completedAt) {
-    return null;
-  }
-
-  const cartToken = String(
-    payload.cart_token ?? payload.token ?? payload.id ?? "",
-  ).trim();
-
-  if (!cartToken) {
-    return null;
-  }
-
-  const customer = payload.customer;
-  const customerFallback =
-    customer && typeof customer === "object"
-      ? String((customer as { first_name?: unknown }).first_name ?? "")
-      : "";
-
-  const customerName = String(
-    payload.customer_first_name ?? payload.first_name ?? customerFallback ?? "",
-  ).trim();
-  const currency = String(payload.currency ?? "USD").trim() || "USD";
-  const checkoutUrl = String(
-    payload.abandoned_checkout_url ?? payload.checkout_url ?? payload.cart_url ?? "",
-  ).trim();
-
-  const noteAttributes = Array.isArray(payload.note_attributes)
-    ? (payload.note_attributes as Array<Record<string, unknown>>)
-    : [];
-
-  const browsingSignals = noteAttributes
-    .map((attribute) => {
-      const name = String(attribute.name ?? "").trim();
-      const value = String(attribute.value ?? "").trim();
-
-      if (!name || !value) {
-        return null;
-      }
-
-      return `${name}: ${value}`;
-    })
-    .filter(Boolean) as string[];
-
-  const landingSite = String(payload.landing_site ?? "").trim();
-  if (landingSite) {
-    browsingSignals.push(`Landing site: ${landingSite}`);
-  }
-
-  return {
-    shopDomain: input.shopDomain,
-    cartToken,
-    email,
-    customerName,
-    currency,
-    subtotal,
-    checkoutUrl,
-    items,
-    browsingSignals,
-  };
+export function checkoutToCartItems(payload: ShopifyCheckoutPayload): CartItem[] {
+  return payload.line_items.map((item) => ({
+    productId: item.product_id?.toString(),
+    variantId: item.variant_id?.toString(),
+    title: item.title,
+    variantTitle: item.variant_title,
+    quantity: item.quantity,
+    price: Number(item.price),
+    imageUrl: item.image_url,
+    productUrl: item.url
+  }));
 }
 
-export function parseOrderConversion(input: {
-  payload: Record<string, unknown>;
-  shopDomain: string;
-}): { shopDomain: string; cartToken?: string; email?: string; orderValue?: number } {
-  const payload = input.payload;
+export function mapShopifyCheckout(payload: ShopifyCheckoutPayload): {
+  checkoutId: string;
+  customerEmail: string;
+  customerFirstName?: string;
+  cartItems: CartItem[];
+  browsingSignals: BrowsingSignal[];
+  cartValue: number;
+  recoveryUrl: string;
+  isAbandoned: boolean;
+} {
+  const cartItems = checkoutToCartItems(payload);
+  const customerEmail = payload.email || payload.customer?.email || "";
+  const recoveryUrl = payload.abandoned_checkout_url || "";
 
   return {
-    shopDomain: input.shopDomain,
-    cartToken: String(payload.cart_token ?? payload.checkout_token ?? "").trim() || undefined,
-    email: String(payload.email ?? "").trim().toLowerCase() || undefined,
-    orderValue: numberFromUnknown(payload.total_price) || undefined,
+    checkoutId: String(payload.id),
+    customerEmail,
+    customerFirstName: payload.customer?.first_name,
+    cartItems,
+    browsingSignals: parseBrowsingSignals(payload.note_attributes),
+    cartValue: Number(payload.total_price),
+    recoveryUrl,
+    isAbandoned: !payload.completed_at
   };
 }

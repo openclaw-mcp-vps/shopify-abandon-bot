@@ -1,453 +1,245 @@
-import "server-only";
+import { createHash, randomUUID } from "crypto";
+import { mkdir, readFile, writeFile } from "fs/promises";
+import path from "path";
 
-import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
-
-export type BillingPlan = "starter" | "agency";
-export type VariantId = "A" | "B";
-
-export type CartItem = {
-  title: string;
-  quantity: number;
-  price: number;
-  variantTitle?: string;
-};
-
-export type EmailVariant = {
-  variant: VariantId;
-  subject: string;
-  body: string;
-  cta: string;
-};
-
-export type AbandonedCartRecord = {
-  id: string;
-  shopDomain: string;
-  cartToken: string;
-  email: string;
-  customerName: string;
-  currency: string;
-  subtotal: number;
-  items: CartItem[];
-  browsingSignals: string[];
-  status: "abandoned" | "emailed" | "converted";
-  variants: EmailVariant[];
-  assignedVariant: VariantId | null;
-  emailMessageId: string | null;
-  abandonedAt: string;
-  emailedAt: string | null;
-  convertedAt: string | null;
-  recoveredRevenue: number;
-};
-
-export type PaywallSession = {
-  token: string;
-  email: string;
-  plan: BillingPlan;
-  storeLimit: number;
-  status: "pending" | "active" | "expired";
-  orderId: string | null;
-  createdAt: string;
-  activatedAt: string | null;
-};
-
-export type StoreInstall = {
-  shopDomain: string;
-  accessToken: string;
-  scopes: string;
-  installedAt: string;
-  updatedAt: string;
-};
-
-type DatabaseSchema = {
-  paywallSessions: PaywallSession[];
-  storeInstalls: StoreInstall[];
-  abandonedCarts: AbandonedCartRecord[];
-};
-
-export type DashboardStats = {
-  totalAbandoned: number;
-  emailsSent: number;
-  converted: number;
-  recoveredRevenue: number;
-  averageCartValue: number;
-  conversionRate: number;
-  variantStats: Array<{
-    variant: VariantId;
-    sent: number;
-    converted: number;
-    conversionRate: number;
-  }>;
-  timeline: Array<{
-    day: string;
-    sent: number;
-    converted: number;
-    revenue: number;
-  }>;
-};
-
-const DEFAULT_DB: DatabaseSchema = {
-  paywallSessions: [],
-  storeInstalls: [],
-  abandonedCarts: [],
-};
+import type {
+  AppDatabase,
+  Campaign,
+  CampaignSummary,
+  PaymentRecord,
+  StoreConnection,
+  WebhookEvent
+} from "@/lib/types";
 
 const DATA_DIR = path.join(process.cwd(), "data");
-const DB_FILE = path.join(DATA_DIR, "database.json");
+const DATA_FILE = path.join(DATA_DIR, "store.json");
 
-let mutationChain: Promise<void> = Promise.resolve();
+const defaultDb: AppDatabase = {
+  stores: [],
+  campaigns: [],
+  payments: [],
+  webhookEvents: []
+};
 
-async function ensureDbFile(): Promise<void> {
+let writeQueue: Promise<void> = Promise.resolve();
+
+async function ensureDataFile(): Promise<void> {
   await mkdir(DATA_DIR, { recursive: true });
 
   try {
-    await readFile(DB_FILE, "utf8");
+    await readFile(DATA_FILE, "utf8");
   } catch {
-    await writeFile(DB_FILE, JSON.stringify(DEFAULT_DB, null, 2), "utf8");
+    await writeFile(DATA_FILE, JSON.stringify(defaultDb, null, 2), "utf8");
   }
 }
 
-async function readDb(): Promise<DatabaseSchema> {
-  await ensureDbFile();
-  const raw = await readFile(DB_FILE, "utf8");
-
-  try {
-    return { ...DEFAULT_DB, ...(JSON.parse(raw) as DatabaseSchema) };
-  } catch {
-    return DEFAULT_DB;
-  }
-}
-
-async function writeDb(db: DatabaseSchema): Promise<void> {
-  await ensureDbFile();
-  await writeFile(DB_FILE, JSON.stringify(db, null, 2), "utf8");
-}
-
-function queueMutation<T>(task: () => Promise<T>): Promise<T> {
-  const next = mutationChain.then(task, task);
-  mutationChain = next.then(
-    () => undefined,
-    () => undefined,
-  );
-  return next;
-}
-
-function planToStoreLimit(plan: BillingPlan): number {
-  return plan === "agency" ? 5 : 1;
-}
-
-export function assignVariant(seed: string): VariantId {
-  const hash = createHash("sha256").update(seed).digest();
-  return hash[0] % 2 === 0 ? "A" : "B";
-}
-
-export async function createPaywallSession(input: {
-  email: string;
-  plan: BillingPlan;
-}): Promise<PaywallSession> {
-  const token = randomBytes(24).toString("hex");
-  const now = new Date().toISOString();
-
-  const session: PaywallSession = {
-    token,
-    email: input.email.toLowerCase(),
-    plan: input.plan,
-    storeLimit: planToStoreLimit(input.plan),
-    status: "pending",
-    orderId: null,
-    createdAt: now,
-    activatedAt: null,
-  };
-
-  await queueMutation(async () => {
-    const db = await readDb();
-    db.paywallSessions.push(session);
-    await writeDb(db);
-  });
-
-  return session;
-}
-
-export async function activatePaywallSession(input: {
-  token?: string;
-  orderId: string;
-  email?: string;
-}): Promise<PaywallSession | null> {
-  return queueMutation(async () => {
-    const db = await readDb();
-    const normalizedEmail = input.email?.toLowerCase();
-
-    let target = input.token
-      ? db.paywallSessions.find((session) => session.token === input.token)
-      : undefined;
-
-    if (!target && normalizedEmail) {
-      const pendingSessions = db.paywallSessions
-        .filter(
-          (session) =>
-            session.email === normalizedEmail && session.status === "pending",
-        )
-        .sort((a, b) => (a.createdAt > b.createdAt ? -1 : 1));
-      target = pendingSessions[0];
-    }
-
-    if (!target) {
-      return null;
-    }
-
-    target.status = "active";
-    target.orderId = input.orderId;
-    target.activatedAt = new Date().toISOString();
-
-    await writeDb(db);
-    return target;
-  });
-}
-
-export async function getPaywallSession(
-  token: string,
-): Promise<PaywallSession | null> {
-  const db = await readDb();
-  return db.paywallSessions.find((session) => session.token === token) ?? null;
-}
-
-export async function hasActivePaywallAccess(
-  token: string | undefined,
-): Promise<boolean> {
-  if (!token) {
-    return false;
-  }
-
-  const session = await getPaywallSession(token);
-  return session?.status === "active";
-}
-
-export async function upsertStoreInstall(input: {
-  shopDomain: string;
-  accessToken: string;
-  scopes: string;
-}): Promise<void> {
-  await queueMutation(async () => {
-    const db = await readDb();
-    const now = new Date().toISOString();
-
-    const existing = db.storeInstalls.find(
-      (install) => install.shopDomain === input.shopDomain,
-    );
-
-    if (existing) {
-      existing.accessToken = input.accessToken;
-      existing.scopes = input.scopes;
-      existing.updatedAt = now;
-    } else {
-      db.storeInstalls.push({
-        shopDomain: input.shopDomain,
-        accessToken: input.accessToken,
-        scopes: input.scopes,
-        installedAt: now,
-        updatedAt: now,
-      });
-    }
-
-    await writeDb(db);
-  });
-}
-
-export async function recordAbandonedCart(input: {
-  shopDomain: string;
-  cartToken: string;
-  email: string;
-  customerName: string;
-  currency: string;
-  subtotal: number;
-  items: CartItem[];
-  browsingSignals: string[];
-}): Promise<AbandonedCartRecord> {
-  const record: AbandonedCartRecord = {
-    id: randomBytes(16).toString("hex"),
-    shopDomain: input.shopDomain,
-    cartToken: input.cartToken,
-    email: input.email.toLowerCase(),
-    customerName: input.customerName,
-    currency: input.currency,
-    subtotal: input.subtotal,
-    items: input.items,
-    browsingSignals: input.browsingSignals,
-    status: "abandoned",
-    variants: [],
-    assignedVariant: null,
-    emailMessageId: null,
-    abandonedAt: new Date().toISOString(),
-    emailedAt: null,
-    convertedAt: null,
-    recoveredRevenue: 0,
-  };
-
-  await queueMutation(async () => {
-    const db = await readDb();
-    db.abandonedCarts.push(record);
-    await writeDb(db);
-  });
-
-  return record;
-}
-
-export async function saveEmailVariants(input: {
-  cartId: string;
-  variants: EmailVariant[];
-  assignedVariant: VariantId;
-}): Promise<AbandonedCartRecord | null> {
-  return queueMutation(async () => {
-    const db = await readDb();
-    const cart = db.abandonedCarts.find((item) => item.id === input.cartId);
-
-    if (!cart) {
-      return null;
-    }
-
-    cart.variants = input.variants;
-    cart.assignedVariant = input.assignedVariant;
-
-    await writeDb(db);
-    return cart;
-  });
-}
-
-export async function markCartEmailed(input: {
-  cartId: string;
-  emailMessageId?: string;
-}): Promise<void> {
-  await queueMutation(async () => {
-    const db = await readDb();
-    const cart = db.abandonedCarts.find((item) => item.id === input.cartId);
-
-    if (!cart) {
-      return;
-    }
-
-    cart.status = "emailed";
-    cart.emailMessageId = input.emailMessageId ?? null;
-    cart.emailedAt = new Date().toISOString();
-
-    await writeDb(db);
-  });
-}
-
-export async function markCartConverted(input: {
-  shopDomain: string;
-  cartToken?: string;
-  email?: string;
-  orderValue?: number;
-}): Promise<void> {
-  await queueMutation(async () => {
-    const db = await readDb();
-
-    const cart = db.abandonedCarts
-      .filter((item) => item.shopDomain === input.shopDomain)
-      .sort((a, b) => (a.abandonedAt > b.abandonedAt ? -1 : 1))
-      .find((item) => {
-        if (input.cartToken && item.cartToken === input.cartToken) {
-          return true;
-        }
-
-        if (input.email && item.email === input.email.toLowerCase()) {
-          return true;
-        }
-
-        return false;
-      });
-
-    if (!cart) {
-      return;
-    }
-
-    cart.status = "converted";
-    cart.convertedAt = new Date().toISOString();
-    cart.recoveredRevenue = input.orderValue ?? cart.subtotal;
-
-    await writeDb(db);
-  });
-}
-
-export async function listRecentAbandonedCarts(
-  limit = 20,
-): Promise<AbandonedCartRecord[]> {
-  const db = await readDb();
-  return db.abandonedCarts
-    .sort((a, b) => (a.abandonedAt > b.abandonedAt ? -1 : 1))
-    .slice(0, limit);
-}
-
-export async function getDashboardStats(): Promise<DashboardStats> {
-  const db = await readDb();
-  const carts = db.abandonedCarts;
-
-  const totalAbandoned = carts.length;
-  const emailsSent = carts.filter((cart) => cart.status !== "abandoned").length;
-  const converted = carts.filter((cart) => cart.status === "converted").length;
-  const recoveredRevenue = carts.reduce(
-    (sum, cart) => sum + (cart.recoveredRevenue || 0),
-    0,
-  );
-  const averageCartValue =
-    totalAbandoned === 0
-      ? 0
-      : carts.reduce((sum, cart) => sum + cart.subtotal, 0) / totalAbandoned;
-  const conversionRate = emailsSent === 0 ? 0 : (converted / emailsSent) * 100;
-
-  const variantStats: DashboardStats["variantStats"] = (["A", "B"] as const).map(
-    (variant) => {
-      const sent = carts.filter((cart) => cart.assignedVariant === variant).length;
-      const won = carts.filter(
-        (cart) =>
-          cart.assignedVariant === variant && cart.status === "converted",
-      ).length;
-
-      return {
-        variant,
-        sent,
-        converted: won,
-        conversionRate: sent === 0 ? 0 : (won / sent) * 100,
-      };
-    },
-  );
-
-  const timelineMap = new Map<
-    string,
-    { sent: number; converted: number; revenue: number }
-  >();
-
-  carts.forEach((cart) => {
-    if (!cart.emailedAt) {
-      return;
-    }
-
-    const day = cart.emailedAt.slice(5, 10);
-    const previous = timelineMap.get(day) ?? { sent: 0, converted: 0, revenue: 0 };
-    previous.sent += 1;
-
-    if (cart.status === "converted") {
-      previous.converted += 1;
-      previous.revenue += cart.recoveredRevenue;
-    }
-
-    timelineMap.set(day, previous);
-  });
-
-  const timeline = [...timelineMap.entries()]
-    .sort((a, b) => (a[0] > b[0] ? 1 : -1))
-    .slice(-14)
-    .map(([day, value]) => ({ day, ...value }));
+async function readDb(): Promise<AppDatabase> {
+  await ensureDataFile();
+  const raw = await readFile(DATA_FILE, "utf8");
+  const parsed = JSON.parse(raw) as Partial<AppDatabase>;
 
   return {
-    totalAbandoned,
-    emailsSent,
-    converted,
-    recoveredRevenue,
-    averageCartValue,
-    conversionRate,
-    variantStats,
-    timeline,
+    stores: parsed.stores ?? [],
+    campaigns: parsed.campaigns ?? [],
+    payments: parsed.payments ?? [],
+    webhookEvents: parsed.webhookEvents ?? []
   };
+}
+
+async function writeDb(nextDb: AppDatabase): Promise<void> {
+  await ensureDataFile();
+  await writeFile(DATA_FILE, JSON.stringify(nextDb, null, 2), "utf8");
+}
+
+async function withWriteLock<T>(operation: (current: AppDatabase) => Promise<T> | T): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    writeQueue = writeQueue
+      .then(async () => {
+        const current = await readDb();
+        const result = await operation(current);
+        await writeDb(current);
+        resolve(result);
+      })
+      .catch((error) => {
+        reject(error);
+      });
+  });
+}
+
+export async function upsertStore(input: {
+  storeDomain: string;
+  accessToken: string;
+  senderEmail: string;
+}): Promise<StoreConnection> {
+  return withWriteLock((current) => {
+    const existingIndex = current.stores.findIndex((store) => store.storeDomain === input.storeDomain);
+
+    const nextStore: StoreConnection = {
+      id: existingIndex >= 0 ? current.stores[existingIndex].id : randomUUID(),
+      storeDomain: input.storeDomain,
+      accessToken: input.accessToken,
+      senderEmail: input.senderEmail,
+      installedAt: existingIndex >= 0 ? current.stores[existingIndex].installedAt : new Date().toISOString(),
+      active: true
+    };
+
+    if (existingIndex >= 0) {
+      current.stores[existingIndex] = nextStore;
+    } else {
+      current.stores.push(nextStore);
+    }
+
+    return nextStore;
+  });
+}
+
+export async function getStoreByDomain(storeDomain: string): Promise<StoreConnection | null> {
+  const db = await readDb();
+  return db.stores.find((store) => store.storeDomain === storeDomain && store.active) ?? null;
+}
+
+export async function listStores(): Promise<StoreConnection[]> {
+  const db = await readDb();
+  return db.stores;
+}
+
+export async function createCampaign(campaign: Omit<Campaign, "id">): Promise<Campaign> {
+  return withWriteLock((current) => {
+    const nextCampaign: Campaign = {
+      ...campaign,
+      id: randomUUID()
+    };
+
+    current.campaigns.push(nextCampaign);
+    return nextCampaign;
+  });
+}
+
+export async function listCampaigns(storeDomain?: string): Promise<Campaign[]> {
+  const db = await readDb();
+  const filtered = storeDomain
+    ? db.campaigns.filter((campaign) => campaign.storeDomain === storeDomain)
+    : db.campaigns;
+
+  return filtered.sort((a, b) => new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime());
+}
+
+export async function updateCampaign(
+  campaignId: string,
+  updater: (campaign: Campaign) => Campaign
+): Promise<Campaign | null> {
+  return withWriteLock((current) => {
+    const index = current.campaigns.findIndex((campaign) => campaign.id === campaignId);
+    if (index === -1) {
+      return null;
+    }
+
+    current.campaigns[index] = updater(current.campaigns[index]);
+    return current.campaigns[index];
+  });
+}
+
+export async function findCampaignByCheckoutId(checkoutId: string): Promise<Campaign | null> {
+  const db = await readDb();
+  return db.campaigns.find((campaign) => campaign.checkoutId === checkoutId) ?? null;
+}
+
+export function summarizeCampaigns(campaigns: Campaign[]): CampaignSummary {
+  const sentCampaigns = campaigns.filter((campaign) => ["sent", "opened", "converted"].includes(campaign.status));
+  const convertedCampaigns = campaigns.filter((campaign) => campaign.status === "converted");
+
+  const variantA = sentCampaigns.filter((campaign) => campaign.assignedVariant === "A");
+  const variantB = sentCampaigns.filter((campaign) => campaign.assignedVariant === "B");
+  const variantAConverted = variantA.filter((campaign) => campaign.status === "converted").length;
+  const variantBConverted = variantB.filter((campaign) => campaign.status === "converted").length;
+
+  const totalRecoveredRevenue = convertedCampaigns.reduce((sum, campaign) => sum + campaign.recoveredRevenue, 0);
+
+  return {
+    totalCampaigns: campaigns.length,
+    totalSent: sentCampaigns.length,
+    totalConverted: convertedCampaigns.length,
+    totalRecoveredRevenue,
+    conversionRate: sentCampaigns.length === 0 ? 0 : (convertedCampaigns.length / sentCampaigns.length) * 100,
+    variantAConversionRate: variantA.length === 0 ? 0 : (variantAConverted / variantA.length) * 100,
+    variantBConversionRate: variantB.length === 0 ? 0 : (variantBConverted / variantB.length) * 100
+  };
+}
+
+export async function recordPayment(input: {
+  orderId: string;
+  email: string;
+  plan: "starter" | "growth";
+  storeLimit: number;
+}): Promise<PaymentRecord> {
+  return withWriteLock((current) => {
+    const existing = current.payments.find((payment) => payment.orderId === input.orderId);
+    if (existing) {
+      return existing;
+    }
+
+    const payment: PaymentRecord = {
+      id: randomUUID(),
+      orderId: input.orderId,
+      email: input.email.toLowerCase(),
+      plan: input.plan,
+      storeLimit: input.storeLimit,
+      createdAt: new Date().toISOString()
+    };
+
+    current.payments.push(payment);
+    return payment;
+  });
+}
+
+export async function findPayment(orderId: string, email: string): Promise<PaymentRecord | null> {
+  const db = await readDb();
+  return (
+    db.payments.find(
+      (payment) => payment.orderId.toLowerCase() === orderId.toLowerCase() && payment.email === email.toLowerCase()
+    ) ?? null
+  );
+}
+
+export async function markPaymentVerified(paymentId: string): Promise<PaymentRecord | null> {
+  return withWriteLock((current) => {
+    const index = current.payments.findIndex((payment) => payment.id === paymentId);
+    if (index === -1) {
+      return null;
+    }
+
+    const existing = current.payments[index];
+    current.payments[index] = {
+      ...existing,
+      verifiedAt: new Date().toISOString()
+    };
+
+    return current.payments[index];
+  });
+}
+
+export async function recordWebhookEvent(input: {
+  source: "shopify" | "lemonsqueezy";
+  topic: string;
+  rawPayload: string;
+}): Promise<WebhookEvent> {
+  return withWriteLock((current) => {
+    const payloadHash = createHash("sha256").update(input.rawPayload).digest("hex");
+
+    const event: WebhookEvent = {
+      id: randomUUID(),
+      source: input.source,
+      topic: input.topic,
+      payloadHash,
+      receivedAt: new Date().toISOString()
+    };
+
+    current.webhookEvents.push(event);
+
+    if (current.webhookEvents.length > 1000) {
+      current.webhookEvents = current.webhookEvents.slice(-1000);
+    }
+
+    return event;
+  });
 }

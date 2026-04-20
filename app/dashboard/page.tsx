@@ -1,121 +1,77 @@
-import type { Metadata } from "next";
-import Link from "next/link";
 import { cookies } from "next/headers";
-import { ArrowLeft, Lock, Webhook } from "lucide-react";
+import Link from "next/link";
+import { redirect } from "next/navigation";
 
-import { EmailPreview } from "@/components/dashboard/email-preview";
-import { DashboardStats } from "@/components/dashboard/stats";
-import { Pricing } from "@/components/pricing";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { PAYWALL_COOKIE_NAME } from "@/lib/constants";
-import {
-  getDashboardStats,
-  getPaywallSession,
-  hasActivePaywallAccess,
-  listRecentAbandonedCarts,
-} from "@/lib/database";
+import { CampaignAnalytics } from "@/components/campaign-analytics";
+import { EmailPreview } from "@/components/email-preview";
+import { listCampaigns, listStores, summarizeCampaigns } from "@/lib/database";
+import { parseAccessToken, PAYWALL_COOKIE_NAME } from "@/lib/paywall";
 
-export const metadata: Metadata = {
-  title: "Dashboard",
-  description:
-    "Monitor abandoned carts, conversion lift, and AI email variants for Shopify Abandon Bot.",
-  robots: {
-    index: false,
-    follow: false,
-  },
-};
+export const dynamic = "force-dynamic";
 
-function LockedState(): React.JSX.Element {
-  return (
-    <main className="px-4 pb-20 pt-12 sm:px-6">
-      <div className="mx-auto max-w-5xl space-y-8">
-        <Card className="border-[#f0883e]/35 bg-[#17110a]">
-          <CardHeader>
-            <Badge variant="muted" className="w-fit">
-              <Lock className="mr-1 h-3.5 w-3.5" />
-              Subscription required
-            </Badge>
-            <CardTitle className="text-2xl">Dashboard access is locked behind an active paid plan</CardTitle>
-            <CardDescription>
-              Complete Lemon Squeezy checkout from the pricing section. Webhook confirmation activates your cookie-based access automatically.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3 sm:flex-row">
-            <Button asChild>
-              <Link href="/#pricing">Open pricing</Link>
-            </Button>
-            <Button asChild variant="outline">
-              <Link href="/">
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                Back to landing
-              </Link>
-            </Button>
-          </CardContent>
-        </Card>
-
-        <Pricing
-          heading="Unlock the full recovery engine"
-          subheading="Once payment succeeds, your current browser cookie gets activated and this dashboard opens immediately."
-        />
-      </div>
-    </main>
-  );
-}
-
-export default async function DashboardPage(): Promise<React.JSX.Element> {
+export default async function DashboardPage() {
   const cookieStore = await cookies();
-  const token = cookieStore.get(PAYWALL_COOKIE_NAME)?.value;
-
-  const access = await hasActivePaywallAccess(token);
+  const access = parseAccessToken(cookieStore.get(PAYWALL_COOKIE_NAME)?.value);
 
   if (!access) {
-    return <LockedState />;
+    redirect("/onboarding?locked=1");
   }
 
-  const [stats, carts, session] = await Promise.all([
-    getDashboardStats(),
-    listRecentAbandonedCarts(12),
-    token ? getPaywallSession(token) : Promise.resolve(null),
-  ]);
-
-  const previewCarts = carts.map((cart) => ({
-    id: cart.id,
-    email: cart.email,
-    customerName: cart.customerName,
-    currency: cart.currency,
-    subtotal: cart.subtotal,
-    items: cart.items,
-    browsingSignals: cart.browsingSignals,
-    status: cart.status,
-    assignedVariant: cart.assignedVariant,
-    variants: cart.variants,
-    abandonedAt: cart.abandonedAt,
-  }));
+  const [campaigns, stores] = await Promise.all([listCampaigns(), listStores()]);
+  const summary = summarizeCampaigns(campaigns);
+  const recentCampaigns = campaigns.slice(0, 8);
 
   return (
-    <main className="px-4 pb-20 pt-8 sm:px-6">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <div className="flex flex-col justify-between gap-4 rounded-2xl border border-[#30363d] bg-[#111922] p-5 sm:flex-row sm:items-center">
+    <main className="mx-auto min-h-screen max-w-6xl px-6 py-8 md:px-8">
+      <header className="mb-6 rounded-2xl border border-slate-800 bg-[#111827cc] p-6">
+        <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
-            <p className="text-xs uppercase tracking-[0.18em] text-[#8b949e]">Shopify Abandon Bot</p>
-            <h1 className="mt-1 text-2xl font-bold">Recovery performance dashboard</h1>
-            <p className="mt-1 text-sm text-[#8b949e]">
-              Active plan: <span className="font-medium text-[#f0f6fc]">{session?.plan ?? "starter"}</span>
-              {" · "}Store limit: {session?.storeLimit ?? 1}
-            </p>
+            <p className="text-xs uppercase tracking-wide text-slate-400">Shopify Abandon Bot</p>
+            <h1 className="mt-1 text-3xl font-semibold text-white">Revenue Recovery Dashboard</h1>
           </div>
-
-          <div className="flex items-center gap-2 rounded-lg border border-[#30363d] bg-[#151b23] px-3 py-2 text-xs text-[#8b949e]">
-            <Webhook className="h-4 w-4 text-[#3fb950]" />
-            Webhook endpoint: /api/shopify/webhook
+          <div className="flex flex-wrap gap-3">
+            <Link className="rounded-full border border-slate-700 px-4 py-2 text-sm hover:border-slate-500" href="/onboarding">
+              Add Store
+            </Link>
+            <Link className="rounded-full border border-slate-700 px-4 py-2 text-sm hover:border-slate-500" href="/">
+              Marketing Site
+            </Link>
           </div>
         </div>
+        <div className="mt-5 grid gap-3 text-sm text-slate-300 sm:grid-cols-3">
+          <p className="rounded-lg border border-slate-700 bg-slate-900/40 px-4 py-3">Plan: {access.plan === "growth" ? "Growth" : "Starter"}</p>
+          <p className="rounded-lg border border-slate-700 bg-slate-900/40 px-4 py-3">
+            Stores connected: {stores.length} / {access.storeLimit}
+          </p>
+          <p className="rounded-lg border border-slate-700 bg-slate-900/40 px-4 py-3">Access email: {access.email}</p>
+        </div>
+      </header>
 
-        <DashboardStats stats={stats} />
-        <EmailPreview carts={previewCarts} />
-      </div>
+      <CampaignAnalytics campaigns={campaigns} summary={summary} />
+
+      <section className="mt-6">
+        <h2 className="mb-4 text-xl font-semibold text-white">Latest Email Variants</h2>
+        {recentCampaigns.length === 0 ? (
+          <div className="rounded-xl border border-slate-800 bg-[#111827cc] p-6 text-sm text-slate-300">
+            No campaigns yet. Once Shopify sends an abandoned checkout webhook, personalized variants and analytics will appear here.
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {recentCampaigns.map((campaign) => (
+              <EmailPreview key={campaign.id} campaign={campaign} />
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="mt-6 rounded-2xl border border-slate-800 bg-[#111827cc] p-6">
+        <h2 className="text-lg font-semibold text-white">Webhook Setup</h2>
+        <p className="mt-2 text-sm leading-relaxed text-slate-300">
+          In Shopify Admin, create a webhook for <code className="rounded bg-slate-900 px-1 py-0.5">checkouts/update</code> and
+          point it to <code className="rounded bg-slate-900 px-1 py-0.5">/api/shopify/webhook</code>. Include browsing signals in
+          <code className="rounded bg-slate-900 px-1 py-0.5">note_attributes.browsing_signals</code> as JSON for stronger personalization.
+        </p>
+      </section>
     </main>
   );
 }

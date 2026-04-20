@@ -1,72 +1,57 @@
 import type { Metadata } from "next";
-import { IBM_Plex_Mono, Space_Grotesk } from "next/font/google";
+import { Space_Grotesk, JetBrains_Mono } from "next/font/google";
+import Script from "next/script";
 
 import "@/app/globals.css";
 
 const spaceGrotesk = Space_Grotesk({
+  variable: "--font-space-grotesk",
   subsets: ["latin"],
-  variable: "--font-sans",
+  display: "swap"
 });
 
-const ibmPlexMono = IBM_Plex_Mono({
+const jetbrainsMono = JetBrains_Mono({
+  variable: "--font-jetbrains-mono",
   subsets: ["latin"],
-  weight: ["400", "500", "600"],
-  variable: "--font-mono",
+  display: "swap"
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"),
-  title: {
-    default: "Shopify Abandon Bot | AI Cart Recovery Emails",
-    template: "%s | Shopify Abandon Bot",
-  },
+  metadataBase: new URL("https://shopify-abandon-bot.com"),
+  title: "Shopify Abandon Bot | AI-Personalized Cart Recovery",
   description:
-    "Recover abandoned Shopify checkouts with AI-personalized cart emails and automatic A/B testing. Lift conversion from ~10% to 28-32%.",
+    "Recover abandoned Shopify checkouts with AI-personalized email variants and built-in A/B testing that lifts conversion to 28-32%.",
   keywords: [
-    "shopify abandoned cart",
-    "ai cart recovery",
-    "ecommerce email automation",
-    "abandoned checkout emails",
+    "Shopify abandoned cart",
+    "AI email personalization",
+    "cart recovery",
+    "ecommerce conversion",
+    "Shopify app"
   ],
   openGraph: {
-    title: "Shopify Abandon Bot",
+    title: "Shopify Abandon Bot — AI-personalized abandon-cart emails",
     description:
-      "AI-personalized abandoned-cart emails with automatic A/B testing for Shopify stores.",
-    url: "/",
-    siteName: "Shopify Abandon Bot",
+      "Connect Shopify, generate personalized recovery emails from cart and browsing behavior, and optimize with automatic A/B tests.",
     type: "website",
-    images: [
-      {
-        url: "/og-image.svg",
-        width: 1200,
-        height: 630,
-        alt: "Shopify Abandon Bot dashboard with email conversion metrics",
-      },
-    ],
+    url: "https://shopify-abandon-bot.com",
+    siteName: "Shopify Abandon Bot"
   },
   twitter: {
     card: "summary_large_image",
-    title: "Shopify Abandon Bot",
-    description:
-      "Recover abandoned carts with AI-written emails and automated A/B testing.",
-    images: ["/og-image.svg"],
+    title: "Shopify Abandon Bot — AI-personalized abandon-cart emails",
+    description: "Convert more abandoned checkouts with AI-written, behavior-aware recovery campaigns."
   },
   robots: {
     index: true,
-    follow: true,
-  },
+    follow: true
+  }
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>): React.JSX.Element {
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className="dark">
-      <body
-        className={`${spaceGrotesk.variable} ${ibmPlexMono.variable} min-h-screen bg-[#0d1117] text-[#f0f6fc] antialiased`}
-      >
+    <html lang="en" suppressHydrationWarning>
+      <body className={`${spaceGrotesk.variable} ${jetbrainsMono.variable} antialiased`}>
+        <Script src="https://app.lemonsqueezy.com/js/lemon.js" strategy="afterInteractive" />
         {children}
       </body>
     </html>

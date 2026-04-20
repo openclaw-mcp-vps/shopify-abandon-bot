@@ -1,80 +1,96 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 
 import { NextResponse } from "next/server";
 
-import { activatePaywallSession } from "@/lib/database";
+import { recordPayment, recordWebhookEvent } from "@/lib/database";
 
-function verifyLemonSignature(rawBody: string, signature: string | null): boolean {
+function verifySignature(rawBody: string, signature: string | null): boolean {
   const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
-
   if (!secret || !signature) {
     return false;
   }
 
-  const normalized = signature.startsWith("sha256=")
-    ? signature.slice("sha256=".length)
-    : signature;
-
-  const digest = createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
-  const digestBuffer = Buffer.from(digest, "utf8");
+  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
+  const normalized = signature.replace(/^sha256=/i, "");
   const signatureBuffer = Buffer.from(normalized, "utf8");
+  const expectedBuffer = Buffer.from(expected, "utf8");
 
-  if (digestBuffer.length !== signatureBuffer.length) {
+  if (signatureBuffer.length !== expectedBuffer.length) {
     return false;
   }
 
-  return timingSafeEqual(digestBuffer, signatureBuffer);
+  return timingSafeEqual(signatureBuffer, expectedBuffer);
+}
+
+function inferPlan(productName: string): { plan: "starter" | "growth"; storeLimit: number } {
+  const lower = productName.toLowerCase();
+
+  if (lower.includes("5 stores") || lower.includes("growth") || lower.includes("99")) {
+    return { plan: "growth", storeLimit: 5 };
+  }
+
+  return { plan: "starter", storeLimit: 1 };
 }
 
 export async function POST(request: Request): Promise<NextResponse> {
   const rawBody = await request.text();
   const signature = request.headers.get("x-signature");
 
-  if (!verifyLemonSignature(rawBody, signature)) {
-    return NextResponse.json({ error: "Invalid webhook signature." }, { status: 401 });
+  if (!verifySignature(rawBody, signature)) {
+    return NextResponse.json({ error: "Invalid webhook signature" }, { status: 401 });
   }
 
+  await recordWebhookEvent({
+    source: "lemonsqueezy",
+    topic: request.headers.get("x-event-name") || "unknown",
+    rawPayload: rawBody
+  });
+
   const payload = JSON.parse(rawBody) as {
-    meta?: {
-      event_name?: string;
-      custom_data?: {
-        paywall_token?: string;
-      };
-    };
+    meta?: { event_name?: string };
     data?: {
-      id?: string | number;
+      id?: string;
       attributes?: {
+        identifier?: string;
         user_email?: string;
+        customer_email?: string;
+        first_order_item?: {
+          product_name?: string;
+          variant_name?: string;
+        };
       };
     };
   };
 
-  const eventName = payload.meta?.event_name ?? "unknown";
+  const eventName = payload.meta?.event_name || "";
+  const allowedEvents = new Set([
+    "order_created",
+    "subscription_created",
+    "subscription_payment_success",
+    "subscription_payment_recovered"
+  ]);
 
-  if (!["order_created", "subscription_created", "subscription_payment_success"].includes(eventName)) {
-    return NextResponse.json({ received: true, ignored: eventName });
+  if (!allowedEvents.has(eventName)) {
+    return NextResponse.json({ ok: true, skipped: true });
   }
 
-  const token = payload.meta?.custom_data?.paywall_token;
-  const email = payload.data?.attributes?.user_email;
-  const orderId = String(payload.data?.id ?? "").trim();
+  const attributes = payload.data?.attributes;
+  const productName = attributes?.first_order_item?.product_name || attributes?.first_order_item?.variant_name || "starter";
+  const { plan, storeLimit } = inferPlan(productName);
 
-  if (!token && !email) {
-    return NextResponse.json(
-      { received: true, warning: "No paywall token or email found on webhook." },
-      { status: 202 },
-    );
+  const orderId = attributes?.identifier || payload.data?.id;
+  const email = attributes?.user_email || attributes?.customer_email;
+
+  if (!orderId || !email) {
+    return NextResponse.json({ error: "Missing order identifier or email" }, { status: 400 });
   }
 
-  const activated = await activatePaywallSession({
-    token,
+  const payment = await recordPayment({
+    orderId,
     email,
-    orderId: orderId || `lemonsqueezy_${Date.now()}`,
+    plan,
+    storeLimit
   });
 
-  return NextResponse.json({
-    received: true,
-    activated: Boolean(activated),
-    plan: activated?.plan ?? null,
-  });
+  return NextResponse.json({ ok: true, paymentId: payment.id });
 }

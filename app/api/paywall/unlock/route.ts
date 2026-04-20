@@ -1,58 +1,71 @@
 import { NextResponse } from "next/server";
-import { z } from "zod";
 
-import { findActiveSubscriptionByEmail } from "@/lib/paywall";
+import { findPayment, markPaymentVerified } from "@/lib/database";
+import { createAccessToken, PAYWALL_COOKIE_NAME } from "@/lib/paywall";
 
-export const runtime = "nodejs";
+interface UnlockRequest {
+  orderId: string;
+  email: string;
+}
 
-const requestSchema = z.object({
-  email: z.string().email(),
-});
+export async function POST(request: Request): Promise<NextResponse> {
+  const body = (await request.json()) as Partial<UnlockRequest>;
+  const orderId = body.orderId?.trim();
+  const email = body.email?.trim().toLowerCase();
 
-export async function POST(request: Request) {
-  const body = await request.json();
-  const parsed = requestSchema.safeParse(body);
-
-  if (!parsed.success) {
-    return NextResponse.json(
-      {
-        error: "A valid billing email is required.",
-      },
-      { status: 400 }
-    );
+  if (!orderId || !email) {
+    return NextResponse.json({ error: "Order ID and email are required" }, { status: 400 });
   }
 
-  const email = parsed.data.email.toLowerCase();
-  const activeSubscription = await findActiveSubscriptionByEmail(email);
+  const payment = await findPayment(orderId, email);
 
-  if (!activeSubscription) {
+  if (!payment) {
     return NextResponse.json(
       {
         error:
-          "No active subscription found for this email yet. Wait 30-60 seconds for webhook sync, then try again.",
+          "Purchase not found yet. Complete checkout first, then retry. If you just paid, webhook delivery can take up to 30 seconds."
       },
-      { status: 402 }
+      { status: 404 }
     );
   }
 
-  const response = NextResponse.json({
-    ok: true,
-    email,
-    plan: activeSubscription.plan,
-    storesAllowed: activeSubscription.storesAllowed,
-  });
+  await markPaymentVerified(payment.id);
 
-  const cookieOptions = {
+  const now = Math.floor(Date.now() / 1000);
+  let accessToken: string;
+
+  try {
+    accessToken = createAccessToken({
+      orderId: payment.orderId,
+      email: payment.email,
+      plan: payment.plan,
+      storeLimit: payment.storeLimit,
+      issuedAt: now,
+      exp: now + 60 * 60 * 24 * 30
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Paywall signing secret is missing. Set PAYWALL_SECRET or LEMON_SQUEEZY_WEBHOOK_SECRET."
+      },
+      { status: 500 }
+    );
+  }
+
+  const response = NextResponse.json({ ok: true, plan: payment.plan, storeLimit: payment.storeLimit });
+
+  response.cookies.set({
+    name: PAYWALL_COOKIE_NAME,
+    value: accessToken,
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    sameSite: "lax" as const,
-    maxAge: 60 * 60 * 24 * 30,
+    sameSite: "lax",
     path: "/",
-  };
-
-  response.cookies.set("abandon_bot_paid", "true", cookieOptions);
-  response.cookies.set("abandon_bot_email", email, cookieOptions);
-  response.cookies.set("abandon_bot_plan", activeSubscription.plan, cookieOptions);
+    maxAge: 60 * 60 * 24 * 30
+  });
 
   return response;
 }

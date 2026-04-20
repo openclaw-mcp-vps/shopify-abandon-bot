@@ -1,107 +1,69 @@
-import crypto from "node:crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 
-import { z } from "zod";
+import type { AccessPayload } from "@/lib/types";
 
-import { readJsonFile, writeJsonFile } from "@/lib/storage";
+export const PAYWALL_COOKIE_NAME = "sb_access";
 
-const SUBSCRIPTIONS_FILE = "subscriptions.json";
-
-const subscriptionRecordSchema = z.object({
-  id: z.string(),
-  email: z.string().email(),
-  status: z.enum(["active", "cancelled", "past_due"]),
-  plan: z.enum(["single-store", "multi-store"]),
-  storesAllowed: z.number().int().positive(),
-  lemonOrderId: z.string().optional(),
-  lemonSubscriptionId: z.string().optional(),
-  shopDomain: z.string().optional(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
-});
-
-export type SubscriptionRecord = z.infer<typeof subscriptionRecordSchema>;
-
-type SubscriptionsStore = {
-  subscriptions: SubscriptionRecord[];
-};
-
-const EMPTY_STORE: SubscriptionsStore = { subscriptions: [] };
-
-function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase();
+function getSecret(): string | null {
+  return process.env.PAYWALL_SECRET || process.env.LEMON_SQUEEZY_WEBHOOK_SECRET || null;
 }
 
-async function readSubscriptions(): Promise<SubscriptionsStore> {
-  return readJsonFile<SubscriptionsStore>(SUBSCRIPTIONS_FILE, EMPTY_STORE);
-}
-
-async function writeSubscriptions(store: SubscriptionsStore) {
-  await writeJsonFile(SUBSCRIPTIONS_FILE, store);
-}
-
-export async function upsertSubscription(
-  input: Omit<SubscriptionRecord, "id" | "createdAt" | "updatedAt"> & {
-    id?: string;
-    createdAt?: string;
-    updatedAt?: string;
-  }
-): Promise<SubscriptionRecord> {
-  const store = await readSubscriptions();
-  const normalizedEmail = normalizeEmail(input.email);
-  const now = new Date().toISOString();
-
-  const existingIndex = store.subscriptions.findIndex(
-    (subscription) =>
-      subscription.email === normalizedEmail ||
-      (input.lemonSubscriptionId &&
-        subscription.lemonSubscriptionId === input.lemonSubscriptionId)
-  );
-
-  if (existingIndex >= 0) {
-    const updated: SubscriptionRecord = {
-      ...store.subscriptions[existingIndex],
-      ...input,
-      email: normalizedEmail,
-      updatedAt: input.updatedAt ?? now,
-    };
-
-    const validated = subscriptionRecordSchema.parse(updated);
-    store.subscriptions[existingIndex] = validated;
-    await writeSubscriptions(store);
-    return validated;
-  }
-
-  const created: SubscriptionRecord = subscriptionRecordSchema.parse({
-    ...input,
-    email: normalizedEmail,
-    id: input.id ?? crypto.randomUUID(),
-    createdAt: input.createdAt ?? now,
-    updatedAt: input.updatedAt ?? now,
-  });
-
-  store.subscriptions.push(created);
-  await writeSubscriptions(store);
-  return created;
-}
-
-export async function findActiveSubscriptionByEmail(
-  email: string
-): Promise<SubscriptionRecord | null> {
-  const store = await readSubscriptions();
-  const normalizedEmail = normalizeEmail(email);
-
-  const subscription = store.subscriptions
-    .filter((item) => item.email === normalizedEmail)
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
-
-  if (!subscription) {
+function sign(value: string): string | null {
+  const secret = getSecret();
+  if (!secret) {
     return null;
   }
 
-  return subscription.status === "active" ? subscription : null;
+  return createHmac("sha256", secret).update(value).digest("base64url");
 }
 
-export async function hasActiveAccess(email: string): Promise<boolean> {
-  const subscription = await findActiveSubscriptionByEmail(email);
-  return Boolean(subscription);
+export function createAccessToken(payload: AccessPayload): string {
+  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const signature = sign(encoded);
+
+  if (!signature) {
+    throw new Error("Missing PAYWALL_SECRET or LEMON_SQUEEZY_WEBHOOK_SECRET");
+  }
+
+  return `${encoded}.${signature}`;
+}
+
+export function parseAccessToken(token: string | undefined): AccessPayload | null {
+  if (!token) {
+    return null;
+  }
+
+  const [encoded, providedSignature] = token.split(".");
+  if (!encoded || !providedSignature) {
+    return null;
+  }
+
+  const expectedSignature = sign(encoded);
+  if (!expectedSignature) {
+    return null;
+  }
+
+  const providedBuffer = Buffer.from(providedSignature);
+  const expectedBuffer = Buffer.from(expectedSignature);
+
+  if (providedBuffer.length !== expectedBuffer.length) {
+    return null;
+  }
+
+  const isValid = timingSafeEqual(providedBuffer, expectedBuffer);
+  if (!isValid) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as AccessPayload;
+
+    if (Date.now() / 1000 > payload.exp) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
 }
