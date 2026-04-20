@@ -1,133 +1,80 @@
-import crypto from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { NextResponse } from "next/server";
 
-import { upsertSubscription } from "@/lib/paywall";
+import { activatePaywallSession } from "@/lib/database";
 
-export const runtime = "nodejs";
-
-function verifySignature(rawBody: string, signature: string): boolean {
+function verifyLemonSignature(rawBody: string, signature: string | null): boolean {
   const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
-  if (!secret) {
+
+  if (!secret || !signature) {
     return false;
   }
 
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody, "utf8")
-    .digest("hex");
+  const normalized = signature.startsWith("sha256=")
+    ? signature.slice("sha256=".length)
+    : signature;
 
-  const a = Buffer.from(digest, "utf8");
-  const b = Buffer.from(signature, "utf8");
+  const digest = createHmac("sha256", secret).update(rawBody, "utf8").digest("hex");
+  const digestBuffer = Buffer.from(digest, "utf8");
+  const signatureBuffer = Buffer.from(normalized, "utf8");
 
-  if (a.length !== b.length) {
+  if (digestBuffer.length !== signatureBuffer.length) {
     return false;
   }
 
-  return crypto.timingSafeEqual(a, b);
+  return timingSafeEqual(digestBuffer, signatureBuffer);
 }
 
-function mapPlan(productName: string | undefined) {
-  const label = (productName ?? "").toLowerCase();
-
-  if (label.includes("5 store") || label.includes("99")) {
-    return {
-      plan: "multi-store" as const,
-      storesAllowed: 5,
-    };
-  }
-
-  return {
-    plan: "single-store" as const,
-    storesAllowed: 1,
-  };
-}
-
-function normalizeEventStatus(eventName: string) {
-  const lower = eventName.toLowerCase();
-
-  if (lower.includes("cancel") || lower.includes("expired")) {
-    return "cancelled" as const;
-  }
-
-  if (lower.includes("payment_failed") || lower.includes("past_due")) {
-    return "past_due" as const;
-  }
-
-  return "active" as const;
-}
-
-export async function POST(request: Request) {
-  const signature = request.headers.get("x-signature") ?? "";
+export async function POST(request: Request): Promise<NextResponse> {
   const rawBody = await request.text();
+  const signature = request.headers.get("x-signature");
 
-  if (!signature || !verifySignature(rawBody, signature)) {
+  if (!verifyLemonSignature(rawBody, signature)) {
     return NextResponse.json({ error: "Invalid webhook signature." }, { status: 401 });
   }
 
-  let payload: {
+  const payload = JSON.parse(rawBody) as {
     meta?: {
       event_name?: string;
-      custom_data?: Record<string, unknown>;
+      custom_data?: {
+        paywall_token?: string;
+      };
     };
     data?: {
-      id?: string;
+      id?: string | number;
       attributes?: {
         user_email?: string;
-        customer_email?: string;
-        status?: string;
-        product_name?: string;
-        first_order_item?: {
-          product_name?: string;
-        };
       };
     };
   };
 
-  try {
-    payload = JSON.parse(rawBody) as typeof payload;
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON payload." }, { status: 400 });
-  }
-
   const eventName = payload.meta?.event_name ?? "unknown";
-  const attributes = payload.data?.attributes;
 
-  const email =
-    (attributes?.user_email ??
-      attributes?.customer_email ??
-      (payload.meta?.custom_data?.email as string | undefined))
-      ?.trim()
-      .toLowerCase() ?? "";
-
-  if (!email) {
-    return NextResponse.json({ ok: true, ignored: "No customer email in webhook." });
+  if (!["order_created", "subscription_created", "subscription_payment_success"].includes(eventName)) {
+    return NextResponse.json({ received: true, ignored: eventName });
   }
 
-  const productName =
-    attributes?.first_order_item?.product_name ?? attributes?.product_name;
-  const mappedPlan = mapPlan(productName);
+  const token = payload.meta?.custom_data?.paywall_token;
+  const email = payload.data?.attributes?.user_email;
+  const orderId = String(payload.data?.id ?? "").trim();
 
-  const status = normalizeEventStatus(eventName);
+  if (!token && !email) {
+    return NextResponse.json(
+      { received: true, warning: "No paywall token or email found on webhook." },
+      { status: 202 },
+    );
+  }
 
-  const subscription = await upsertSubscription({
+  const activated = await activatePaywallSession({
+    token,
     email,
-    status,
-    plan: mappedPlan.plan,
-    storesAllowed: mappedPlan.storesAllowed,
-    lemonOrderId: payload.data?.id,
-    lemonSubscriptionId: payload.data?.id,
-    shopDomain:
-      typeof payload.meta?.custom_data?.shop_domain === "string"
-        ? payload.meta.custom_data.shop_domain
-        : undefined,
+    orderId: orderId || `lemonsqueezy_${Date.now()}`,
   });
 
   return NextResponse.json({
-    ok: true,
-    eventName,
-    email,
-    status: subscription.status,
-    plan: subscription.plan,
+    received: true,
+    activated: Boolean(activated),
+    plan: activated?.plan ?? null,
   });
 }

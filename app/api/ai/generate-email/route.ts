@@ -1,63 +1,96 @@
-import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
-import { z } from "zod";
+import { cookies } from "next/headers";
 
-import { generateAbandonEmail } from "@/lib/ai-email-generator";
+import { PAYWALL_COOKIE_NAME } from "@/lib/constants";
+import { generatePersonalizedEmail } from "@/lib/ai";
+import { hasActivePaywallAccess, type CartItem } from "@/lib/database";
 
-export const runtime = "nodejs";
+function sanitizeCartItems(value: unknown): CartItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
 
-const requestSchema = z.object({
-  storeName: z.string().min(2),
-  shopDomain: z.string().optional(),
-  customerFirstName: z.string().min(1),
-  customerEmail: z.string().email().optional(),
-  currency: z.string().optional(),
-  cartItems: z
-    .array(
-      z.object({
-        title: z.string().min(1),
-        quantity: z.number().int().positive(),
-        price: z.number().nonnegative(),
-      })
-    )
-    .min(1),
-  cartValue: z.number().positive().optional(),
-  browsingSignals: z.array(z.string()).default([]),
-});
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
 
-export async function POST(request: Request) {
+      const typed = item as {
+        title?: unknown;
+        quantity?: unknown;
+        price?: unknown;
+        variantTitle?: unknown;
+      };
+
+      const title = String(typed.title ?? "").trim();
+      const quantity = Number(typed.quantity ?? 1);
+      const price = Number(typed.price ?? 0);
+
+      if (!title || !Number.isFinite(quantity) || !Number.isFinite(price)) {
+        return null;
+      }
+
+      return {
+        title,
+        quantity: Math.max(1, Math.round(quantity)),
+        price,
+        variantTitle: typed.variantTitle ? String(typed.variantTitle) : undefined,
+      } satisfies CartItem;
+    })
+    .filter(Boolean) as CartItem[];
+}
+
+export async function POST(request: Request): Promise<NextResponse> {
   const cookieStore = await cookies();
-  const hasAccess = cookieStore.get("abandon_bot_paid")?.value === "true";
+  const token = cookieStore.get(PAYWALL_COOKIE_NAME)?.value;
+
+  const hasAccess = await hasActivePaywallAccess(token);
 
   if (!hasAccess) {
     return NextResponse.json(
-      {
-        error:
-          "Paid access required. Complete checkout and unlock from onboarding first.",
-      },
-      { status: 402 }
+      { error: "Active subscription required to generate email variants." },
+      { status: 402 },
     );
   }
 
-  const body = await request.json();
-  const parsed = requestSchema.safeParse(body);
+  const body = (await request.json()) as {
+    storeName?: unknown;
+    customerName?: unknown;
+    cartItems?: unknown;
+    browsingSignals?: unknown;
+    cartValue?: unknown;
+    currency?: unknown;
+  };
 
-  if (!parsed.success) {
+  const cartItems = sanitizeCartItems(body.cartItems);
+
+  if (cartItems.length === 0) {
     return NextResponse.json(
-      {
-        error: "Invalid payload",
-        details: parsed.error.flatten(),
-      },
-      { status: 400 }
+      { error: "cartItems must include at least one item." },
+      { status: 400 },
     );
   }
 
-  const generated = await generateAbandonEmail({
-    ...parsed.data,
-    currency: parsed.data.currency ?? "USD",
+  const cartValueRaw = Number(body.cartValue ?? 0);
+  const cartValue = Number.isFinite(cartValueRaw)
+    ? cartValueRaw
+    : cartItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
+
+  const browsingSignals = Array.isArray(body.browsingSignals)
+    ? body.browsingSignals
+        .map((signal) => String(signal).trim())
+        .filter((signal) => signal.length > 0)
+    : [];
+
+  const generated = await generatePersonalizedEmail({
+    storeName: String(body.storeName ?? "Your Store").trim() || "Your Store",
+    customerName: String(body.customerName ?? "there").trim() || "there",
+    cartItems,
+    browsingSignals,
+    cartValue,
+    currency: String(body.currency ?? "USD").trim() || "USD",
   });
 
-  return NextResponse.json({
-    generated,
-  });
+  return NextResponse.json(generated);
 }

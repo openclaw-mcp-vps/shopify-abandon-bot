@@ -1,231 +1,267 @@
-import crypto from "node:crypto";
+import "server-only";
 
-import { shopifyApi } from "@shopify/shopify-api";
-import { z } from "zod";
+import "@shopify/shopify-api/adapters/node";
 
-import { readJsonFile, writeJsonFile } from "@/lib/storage";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
-const STORES_FILE = "stores.json";
+import type { CartItem } from "@/lib/database";
 
-const shopConnectionSchema = z.object({
-  id: z.string(),
-  shopDomain: z.string(),
-  accessToken: z.string(),
-  ownerEmail: z.string().email().optional(),
-  installedAt: z.string(),
-  updatedAt: z.string(),
-});
+export const SHOPIFY_API_VERSION = "2025-10";
 
-export type ShopConnection = z.infer<typeof shopConnectionSchema>;
-
-type StoreConnectionFile = {
-  stores: ShopConnection[];
+export type ParsedAbandonmentPayload = {
+  shopDomain: string;
+  cartToken: string;
+  email: string;
+  customerName: string;
+  currency: string;
+  subtotal: number;
+  checkoutUrl: string;
+  items: CartItem[];
+  browsingSignals: string[];
 };
 
-const EMPTY_STORES: StoreConnectionFile = { stores: [] };
-
-function getShopifyApiKey() {
-  return process.env.SHOPIFY_API_KEY ?? "";
+function env(name: string): string {
+  return process.env[name] ?? "";
 }
 
-function getShopifyApiSecret() {
-  return process.env.SHOPIFY_API_SECRET ?? "";
+export function isValidShopDomain(shop: string): boolean {
+  return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/i.test(shop);
 }
 
-function getAppUrl() {
-  return (
-    process.env.NEXT_PUBLIC_APP_URL ??
-    process.env.APP_URL ??
-    "http://localhost:3000"
-  );
-}
+export function buildShopifyInstallUrl(shop: string, state: string): string {
+  const apiKey = env("SHOPIFY_API_KEY");
+  const scopes = env("SHOPIFY_SCOPES") || "read_orders,read_customers,read_checkouts";
+  const appUrl = env("NEXT_PUBLIC_APP_URL") || "http://localhost:3000";
+  const redirectUri = `${appUrl}/api/shopify/install`;
 
-export function getScopes() {
-  return (process.env.SHOPIFY_SCOPES ?? "read_products,read_checkouts")
-    .split(",")
-    .map((scope) => scope.trim())
-    .filter(Boolean);
-}
-
-let cachedShopifyClient: ReturnType<typeof shopifyApi> | null = null;
-
-export function getShopifyClient() {
-  if (cachedShopifyClient) {
-    return cachedShopifyClient;
-  }
-
-  cachedShopifyClient = shopifyApi({
-    apiKey: getShopifyApiKey() || "missing",
-    apiSecretKey: getShopifyApiSecret() || "missing",
-    scopes: getScopes(),
-    hostName: new URL(getAppUrl()).host,
-    isEmbeddedApp: false,
-    apiVersion: (process.env.SHOPIFY_API_VERSION ?? "2025-10") as never,
+  const params = new URLSearchParams({
+    client_id: apiKey,
+    scope: scopes,
+    redirect_uri: redirectUri,
+    state,
   });
 
-  return cachedShopifyClient;
+  return `https://${shop}/admin/oauth/authorize?${params.toString()}`;
 }
 
-export function sanitizeShopDomain(input: string): string | null {
-  const value = input.trim().toLowerCase();
-  if (!value) {
-    return null;
-  }
+export function verifyShopifyInstallHmac(params: URLSearchParams): boolean {
+  const secret = env("SHOPIFY_API_SECRET");
+  const hmac = params.get("hmac");
 
-  const normalized = value.endsWith(".myshopify.com")
-    ? value
-    : `${value}.myshopify.com`;
-
-  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(normalized)) {
-    return null;
-  }
-
-  return normalized;
-}
-
-export function buildOAuthStartUrl(shopDomain: string, state: string) {
-  const redirectUri = `${getAppUrl()}/api/shopify/auth`;
-  const url = new URL(`https://${shopDomain}/admin/oauth/authorize`);
-
-  url.searchParams.set("client_id", getShopifyApiKey());
-  url.searchParams.set("scope", getScopes().join(","));
-  url.searchParams.set("redirect_uri", redirectUri);
-  url.searchParams.set("state", state);
-
-  return url.toString();
-}
-
-function timingSafeCompare(a: string, b: string): boolean {
-  const aBuf = Buffer.from(a, "utf8");
-  const bBuf = Buffer.from(b, "utf8");
-
-  if (aBuf.length !== bBuf.length) {
+  if (!secret || !hmac) {
     return false;
   }
 
-  return crypto.timingSafeEqual(aBuf, bBuf);
-}
-
-export function verifyOAuthHmac(query: URLSearchParams, hmac: string): boolean {
-  const params = new URLSearchParams(query);
-  params.delete("hmac");
-  params.delete("signature");
-
-  const message = [...params.entries()]
+  const sanitized = [...params.entries()]
+    .filter(([key]) => key !== "hmac" && key !== "signature")
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, value]) => `${key}=${value}`)
     .join("&");
 
-  const digest = crypto
-    .createHmac("sha256", getShopifyApiSecret())
-    .update(message)
-    .digest("hex");
+  const digest = createHmac("sha256", secret).update(sanitized).digest("hex");
 
-  return timingSafeCompare(digest, hmac);
+  const digestBuffer = Buffer.from(digest, "utf8");
+  const hmacBuffer = Buffer.from(hmac, "utf8");
+
+  if (digestBuffer.length !== hmacBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(digestBuffer, hmacBuffer);
 }
 
-export function verifyWebhookHmac(rawBody: string, receivedHmac: string): boolean {
-  const digest = crypto
-    .createHmac("sha256", getShopifyApiSecret())
-    .update(rawBody, "utf8")
-    .digest("base64");
-
-  return timingSafeCompare(digest, receivedHmac);
-}
-
-export async function exchangeCodeForAccessToken(params: {
-  shopDomain: string;
+export async function exchangeShopifyCodeForToken(input: {
+  shop: string;
   code: string;
-}) {
+}): Promise<{ accessToken: string; scope: string } | null> {
+  const apiKey = env("SHOPIFY_API_KEY");
+  const apiSecret = env("SHOPIFY_API_SECRET");
+
+  if (!apiKey || !apiSecret) {
+    return null;
+  }
+
   const response = await fetch(
-    `https://${params.shopDomain}/admin/oauth/access_token`,
+    `https://${input.shop}/admin/oauth/access_token`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        client_id: getShopifyApiKey(),
-        client_secret: getShopifyApiSecret(),
-        code: params.code,
+        client_id: apiKey,
+        client_secret: apiSecret,
+        code: input.code,
       }),
-    }
+    },
   );
 
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to exchange access token: ${response.status} ${text}`);
+    return null;
   }
 
-  const payload = (await response.json()) as { access_token: string };
+  const data = (await response.json()) as {
+    access_token?: string;
+    scope?: string;
+  };
 
-  if (!payload.access_token) {
-    throw new Error("Shopify did not return an access token.");
+  if (!data.access_token) {
+    return null;
   }
 
-  return payload.access_token;
+  return {
+    accessToken: data.access_token,
+    scope: data.scope ?? env("SHOPIFY_SCOPES"),
+  };
 }
 
-async function readConnections(): Promise<StoreConnectionFile> {
-  return readJsonFile<StoreConnectionFile>(STORES_FILE, EMPTY_STORES);
-}
+export function verifyShopifyWebhook(input: {
+  rawBody: string;
+  hmacHeader: string | null;
+}): boolean {
+  const secret = env("SHOPIFY_WEBHOOK_SECRET") || env("SHOPIFY_API_SECRET");
 
-async function writeConnections(file: StoreConnectionFile) {
-  await writeJsonFile(STORES_FILE, file);
-}
-
-export async function upsertShopConnection(
-  input: Omit<ShopConnection, "id" | "installedAt" | "updatedAt"> & {
-    id?: string;
-    installedAt?: string;
-    updatedAt?: string;
-  }
-): Promise<ShopConnection> {
-  const file = await readConnections();
-  const now = new Date().toISOString();
-  const existingIndex = file.stores.findIndex(
-    (store) => store.shopDomain === input.shopDomain
-  );
-
-  if (existingIndex >= 0) {
-    const updated = shopConnectionSchema.parse({
-      ...file.stores[existingIndex],
-      ...input,
-      updatedAt: input.updatedAt ?? now,
-    });
-
-    file.stores[existingIndex] = updated;
-    await writeConnections(file);
-
-    return updated;
+  if (!secret || !input.hmacHeader) {
+    return false;
   }
 
-  const created = shopConnectionSchema.parse({
-    ...input,
-    id: input.id ?? crypto.randomUUID(),
-    installedAt: input.installedAt ?? now,
-    updatedAt: input.updatedAt ?? now,
-  });
+  const generated = createHmac("sha256", secret)
+    .update(input.rawBody, "utf8")
+    .digest("base64");
 
-  file.stores.push(created);
-  await writeConnections(file);
+  const generatedBuffer = Buffer.from(generated, "utf8");
+  const headerBuffer = Buffer.from(input.hmacHeader, "utf8");
 
-  return created;
+  if (generatedBuffer.length !== headerBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(generatedBuffer, headerBuffer);
 }
 
-export async function getShopConnection(shopDomain: string) {
-  const file = await readConnections();
-  return file.stores.find((store) => store.shopDomain === shopDomain) ?? null;
+function numberFromUnknown(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  return 0;
 }
 
-export function parseBrowsingSignals(
-  noteAttributes?: Array<{ name: string; value: string }>
-): string[] {
-  if (!Array.isArray(noteAttributes)) {
+function parseCartItems(payload: Record<string, unknown>): CartItem[] {
+  const source = payload.line_items;
+
+  if (!Array.isArray(source)) {
     return [];
   }
 
-  return noteAttributes
-    .map((attribute) => `${attribute.name}: ${attribute.value}`)
-    .slice(0, 4);
+  return source
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+
+      const typed = item as Record<string, unknown>;
+      const title = String(typed.title ?? "Untitled product").trim();
+      const quantity = numberFromUnknown(typed.quantity) || 1;
+      const price = numberFromUnknown(typed.price);
+      const variantTitle = String(typed.variant_title ?? "").trim() || undefined;
+
+      return {
+        title,
+        quantity,
+        price,
+        variantTitle,
+      } satisfies CartItem;
+    })
+    .filter(Boolean) as CartItem[];
+}
+
+export function parseAbandonmentPayload(input: {
+  payload: Record<string, unknown>;
+  shopDomain: string;
+}): ParsedAbandonmentPayload | null {
+  const payload = input.payload;
+  const items = parseCartItems(payload);
+  const email = String(payload.email ?? "").trim().toLowerCase();
+  const subtotal = numberFromUnknown(payload.subtotal_price);
+  const completedAt = payload.completed_at;
+
+  if (!email || items.length === 0 || completedAt) {
+    return null;
+  }
+
+  const cartToken = String(
+    payload.cart_token ?? payload.token ?? payload.id ?? "",
+  ).trim();
+
+  if (!cartToken) {
+    return null;
+  }
+
+  const customer = payload.customer;
+  const customerFallback =
+    customer && typeof customer === "object"
+      ? String((customer as { first_name?: unknown }).first_name ?? "")
+      : "";
+
+  const customerName = String(
+    payload.customer_first_name ?? payload.first_name ?? customerFallback ?? "",
+  ).trim();
+  const currency = String(payload.currency ?? "USD").trim() || "USD";
+  const checkoutUrl = String(
+    payload.abandoned_checkout_url ?? payload.checkout_url ?? payload.cart_url ?? "",
+  ).trim();
+
+  const noteAttributes = Array.isArray(payload.note_attributes)
+    ? (payload.note_attributes as Array<Record<string, unknown>>)
+    : [];
+
+  const browsingSignals = noteAttributes
+    .map((attribute) => {
+      const name = String(attribute.name ?? "").trim();
+      const value = String(attribute.value ?? "").trim();
+
+      if (!name || !value) {
+        return null;
+      }
+
+      return `${name}: ${value}`;
+    })
+    .filter(Boolean) as string[];
+
+  const landingSite = String(payload.landing_site ?? "").trim();
+  if (landingSite) {
+    browsingSignals.push(`Landing site: ${landingSite}`);
+  }
+
+  return {
+    shopDomain: input.shopDomain,
+    cartToken,
+    email,
+    customerName,
+    currency,
+    subtotal,
+    checkoutUrl,
+    items,
+    browsingSignals,
+  };
+}
+
+export function parseOrderConversion(input: {
+  payload: Record<string, unknown>;
+  shopDomain: string;
+}): { shopDomain: string; cartToken?: string; email?: string; orderValue?: number } {
+  const payload = input.payload;
+
+  return {
+    shopDomain: input.shopDomain,
+    cartToken: String(payload.cart_token ?? payload.checkout_token ?? "").trim() || undefined,
+    email: String(payload.email ?? "").trim().toLowerCase() || undefined,
+    orderValue: numberFromUnknown(payload.total_price) || undefined,
+  };
 }

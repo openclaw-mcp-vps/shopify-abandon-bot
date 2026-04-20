@@ -1,0 +1,19 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#1c2430"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <circle cx="960" cy="120" r="220" fill="#3fb950" fill-opacity="0.18"/>
+  <circle cx="200" cy="580" r="260" fill="#58a6ff" fill-opacity="0.12"/>
+  <rect x="120" y="140" width="960" height="350" rx="24" fill="#151b23" stroke="#30363d"/>
+  <text x="170" y="230" fill="#84f6a0" font-family="Arial, sans-serif" font-size="34" font-weight="700">Shopify Abandon Bot</text>
+  <text x="170" y="285" fill="#f0f6fc" font-family="Arial, sans-serif" font-size="54" font-weight="700">AI-Personalized Recovery Emails</text>
+  <text x="170" y="340" fill="#8b949e" font-family="Arial, sans-serif" font-size="30">Recover abandoned carts with automatic A/B testing</text>
+  <rect x="170" y="390" width="270" height="62" rx="12" fill="#2ea043"/>
+  <text x="198" y="430" fill="#08120b" font-family="Arial, sans-serif" font-size="30" font-weight="700">28-32% Conversion</text>
+  <rect x="468" y="390" width="196" height="62" rx="12" fill="#1c2430" stroke="#30363d"/>
+  <text x="500" y="430" fill="#f0f6fc" font-family="Arial, sans-serif" font-size="30" font-weight="700">$29/mo</text>
+</svg>

@@ -1,45 +1,55 @@
 import type { Metadata } from "next";
 import { IBM_Plex_Mono, Space_Grotesk } from "next/font/google";
 
-import "./globals.css";
+import "@/app/globals.css";
 
 const spaceGrotesk = Space_Grotesk({
   subsets: ["latin"],
-  variable: "--font-space-grotesk",
-  display: "swap",
+  variable: "--font-sans",
 });
 
-const plexMono = IBM_Plex_Mono({
+const ibmPlexMono = IBM_Plex_Mono({
   subsets: ["latin"],
-  variable: "--font-plex-mono",
-  weight: ["400", "500", "700"],
-  display: "swap",
+  weight: ["400", "500", "600"],
+  variable: "--font-mono",
 });
-
-const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? "https://shopify-abandon-bot.com";
 
 export const metadata: Metadata = {
-  metadataBase: new URL(appUrl),
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"),
   title: {
-    default: "Shopify Abandon Bot",
+    default: "Shopify Abandon Bot | AI Cart Recovery Emails",
     template: "%s | Shopify Abandon Bot",
   },
   description:
-    "AI-personalized Shopify abandon-cart emails with automated A/B testing and a conversion-focused recovery dashboard.",
+    "Recover abandoned Shopify checkouts with AI-personalized cart emails and automatic A/B testing. Lift conversion from ~10% to 28-32%.",
+  keywords: [
+    "shopify abandoned cart",
+    "ai cart recovery",
+    "ecommerce email automation",
+    "abandoned checkout emails",
+  ],
   openGraph: {
     title: "Shopify Abandon Bot",
     description:
-      "Recover more abandoned carts with AI-personalized email copy and automated A/B optimization.",
-    url: appUrl,
+      "AI-personalized abandoned-cart emails with automatic A/B testing for Shopify stores.",
+    url: "/",
     siteName: "Shopify Abandon Bot",
-    locale: "en_US",
     type: "website",
+    images: [
+      {
+        url: "/og-image.svg",
+        width: 1200,
+        height: 630,
+        alt: "Shopify Abandon Bot dashboard with email conversion metrics",
+      },
+    ],
   },
   twitter: {
     card: "summary_large_image",
     title: "Shopify Abandon Bot",
     description:
-      "Connect Shopify, generate personalized recoveries, and track conversion lift in one dashboard.",
+      "Recover abandoned carts with AI-written emails and automated A/B testing.",
+    images: ["/og-image.svg"],
   },
   robots: {
     index: true,
@@ -51,14 +61,12 @@ export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
-}>) {
+}>): React.JSX.Element {
   return (
-    <html
-      lang="en"
-      className={`dark ${spaceGrotesk.variable} ${plexMono.variable} h-full`}
-      suppressHydrationWarning
-    >
-      <body className="min-h-full bg-background text-foreground antialiased">
+    <html lang="en" className="dark">
+      <body
+        className={`${spaceGrotesk.variable} ${ibmPlexMono.variable} min-h-screen bg-[#0d1117] text-[#f0f6fc] antialiased`}
+      >
         {children}
       </body>
     </html>

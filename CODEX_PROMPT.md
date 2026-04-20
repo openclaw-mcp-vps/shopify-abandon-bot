@@ -11,25 +11,24 @@ NICHE: ecom-tools
 PRICE: $$29/mo per store, $99/mo for 5 stores/mo
 
 ARCHITECTURE SPEC:
-Next.js SaaS with Shopify webhook integration for cart abandonment events. AI service analyzes customer data and generates personalized email content, while automated A/B testing optimizes performance across campaigns.
+Next.js SaaS with Shopify webhook integration for cart abandonment events. AI service analyzes customer data and generates personalized email content, while automated A/B testing optimizes performance.
 
 PLANNED FILES:
+- app/page.tsx
+- app/dashboard/page.tsx
 - app/api/shopify/webhook/route.ts
-- app/api/shopify/auth/route.ts
+- app/api/shopify/install/route.ts
 - app/api/ai/generate-email/route.ts
 - app/api/lemonsqueezy/webhook/route.ts
-- app/dashboard/page.tsx
-- app/onboarding/page.tsx
 - lib/shopify.ts
-- lib/ai-email-generator.ts
-- lib/email-sender.ts
-- lib/ab-testing.ts
-- lib/analytics.ts
-- components/dashboard/stats-overview.tsx
-- components/dashboard/email-templates.tsx
-- components/onboarding/shopify-connect.tsx
+- lib/ai.ts
+- lib/database.ts
+- lib/email.ts
+- components/dashboard/stats.tsx
+- components/dashboard/email-preview.tsx
+- components/pricing.tsx
 
-DEPENDENCIES: next, tailwindcss, @shopify/shopify-api, openai, nodemailer, @lemonsqueezy/lemonsqueezy.js, prisma, @prisma/client, next-auth, stripe, recharts, framer-motion, zod, react-hook-form
+DEPENDENCIES: next, tailwindcss, @shopify/shopify-api, openai, prisma, @prisma/client, nodemailer, @lemonsqueezy/lemonsqueezy.js, stripe, recharts, lucide-react
 
 REQUIREMENTS:
 - Next.js 15 with App Router (app/ directory)
