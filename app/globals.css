@@ -2,73 +2,27 @@
 
 :root {
   color-scheme: dark;
-  --background: #0d1117;
-  --surface: #111827;
-  --surface-soft: #161f2c;
-  --text: #f5f7ff;
-  --muted: #a8b3c7;
-  --border: #263244;
-  --accent: #29b6f6;
-  --accent-2: #61ffca;
-  --danger: #ff6b6b;
 }
 
 * {
-  border-color: var(--border);
+  box-sizing: border-box;
 }
 
 html,
 body {
+  margin: 0;
   min-height: 100%;
+  background: #0d1117;
 }
 
 body {
-  margin: 0;
-  background:
-    radial-gradient(circle at 20% 15%, rgba(41, 182, 246, 0.18), transparent 30%),
-    radial-gradient(circle at 85% 10%, rgba(97, 255, 202, 0.12), transparent 25%),
-    var(--background);
-  color: var(--text);
-  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  color: #f4f4f5;
+  background-image:
+    radial-gradient(circle at 15% -20%, rgba(56, 189, 248, 0.2), transparent 45%),
+    radial-gradient(circle at 85% 10%, rgba(16, 185, 129, 0.12), transparent 35%),
+    linear-gradient(180deg, rgba(13, 17, 23, 1), rgba(8, 11, 16, 1));
 }
 
 a {
   color: inherit;
-  text-decoration: none;
-}
-
-.grid-overlay {
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
-  background-size: 36px 36px;
-}
-
-.panel {
-  background: linear-gradient(140deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015));
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  backdrop-filter: blur(10px);
-}
-
-.kpi {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 16px;
-  background: rgba(8, 13, 24, 0.78);
-}
-
-@keyframes fade-up {
-  from {
-    opacity: 0;
-    transform: translateY(16px);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.animate-fade-up {
-  animation: fade-up 0.55s ease-out both;
 }

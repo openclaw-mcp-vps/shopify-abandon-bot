@@ -1,69 +1,72 @@
-import { createHmac, timingSafeEqual } from "crypto";
+import crypto from "node:crypto";
 
-import type { AccessPayload } from "@/lib/types";
+export const ACCESS_COOKIE_NAME = "sab_access";
 
-export const PAYWALL_COOKIE_NAME = "sb_access";
+export type AccessSession = {
+  email: string;
+  storeLimit: number;
+  exp: number;
+};
 
-function getSecret(): string | null {
-  return process.env.PAYWALL_SECRET || process.env.LEMON_SQUEEZY_WEBHOOK_SECRET || null;
+const ACCESS_MAX_AGE_SECONDS = 60 * 60 * 24 * 30;
+
+function getSigningSecret() {
+  return process.env.STRIPE_WEBHOOK_SECRET || "dev-only-signing-secret";
 }
 
-function sign(value: string): string | null {
-  const secret = getSecret();
-  if (!secret) {
-    return null;
-  }
-
-  return createHmac("sha256", secret).update(value).digest("base64url");
+function signValue(value: string) {
+  return crypto
+    .createHmac("sha256", getSigningSecret())
+    .update(value)
+    .digest("hex");
 }
 
-export function createAccessToken(payload: AccessPayload): string {
+export function createAccessToken(email: string, storeLimit: number) {
+  const payload: AccessSession = {
+    email: email.toLowerCase(),
+    storeLimit,
+    exp: Math.floor(Date.now() / 1000) + ACCESS_MAX_AGE_SECONDS
+  };
+
   const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  const signature = sign(encoded);
-
-  if (!signature) {
-    throw new Error("Missing PAYWALL_SECRET or LEMON_SQUEEZY_WEBHOOK_SECRET");
-  }
-
+  const signature = signValue(encoded);
   return `${encoded}.${signature}`;
 }
 
-export function parseAccessToken(token: string | undefined): AccessPayload | null {
+export function verifyAccessToken(token?: string | null): AccessSession | null {
   if (!token) {
     return null;
   }
 
-  const [encoded, providedSignature] = token.split(".");
-  if (!encoded || !providedSignature) {
+  const [encoded, signature] = token.split(".");
+  if (!encoded || !signature) {
     return null;
   }
 
-  const expectedSignature = sign(encoded);
-  if (!expectedSignature) {
-    return null;
-  }
-
-  const providedBuffer = Buffer.from(providedSignature);
-  const expectedBuffer = Buffer.from(expectedSignature);
-
-  if (providedBuffer.length !== expectedBuffer.length) {
-    return null;
-  }
-
-  const isValid = timingSafeEqual(providedBuffer, expectedBuffer);
-  if (!isValid) {
+  const expectedSignature = signValue(encoded);
+  if (signature !== expectedSignature) {
     return null;
   }
 
   try {
-    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as AccessPayload;
+    const parsed = JSON.parse(
+      Buffer.from(encoded, "base64url").toString("utf8")
+    ) as AccessSession;
 
-    if (Date.now() / 1000 > payload.exp) {
+    if (!parsed.email || !parsed.storeLimit || !parsed.exp) {
       return null;
     }
 
-    return payload;
+    if (parsed.exp < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+
+    return parsed;
   } catch {
     return null;
   }
+}
+
+export function getAccessCookieMaxAge() {
+  return ACCESS_MAX_AGE_SECONDS;
 }

@@ -11,24 +11,25 @@ NICHE: ecom-tools
 PRICE: $$29/mo per store, $99/mo for 5 stores/mo
 
 ARCHITECTURE SPEC:
-Next.js SaaS app with Shopify webhook integration for cart abandonment events. AI service analyzes cart contents and customer data to generate personalized email campaigns via email provider API. Dashboard shows A/B test results and conversion metrics.
+Next.js SaaS with Shopify webhook integration for cart abandonment events. AI service analyzes cart contents and customer data to generate personalized email campaigns via email provider API. Dashboard shows A/B test results and conversion metrics.
 
 PLANNED FILES:
-- app/page.tsx
-- app/dashboard/page.tsx
 - app/api/shopify/webhook/route.ts
 - app/api/shopify/auth/route.ts
 - app/api/ai/generate-email/route.ts
+- app/api/campaigns/route.ts
 - app/api/lemonsqueezy/webhook/route.ts
+- app/dashboard/page.tsx
+- app/onboarding/page.tsx
+- app/pricing/page.tsx
 - lib/shopify.ts
-- lib/ai-service.ts
-- lib/email-provider.ts
+- lib/ai.ts
+- lib/email.ts
 - lib/database.ts
-- components/dashboard/metrics.tsx
-- components/dashboard/email-preview.tsx
-- components/pricing.tsx
+- components/EmailPreview.tsx
+- components/CampaignStats.tsx
 
-DEPENDENCIES: next, tailwindcss, @shopify/shopify-api, openai, prisma, @prisma/client, resend, lemonsqueezy.js, stripe, react-hook-form, recharts, lucide-react
+DEPENDENCIES: next, tailwindcss, @shopify/shopify-api, openai, resend, @lemonsqueezy/lemonsqueezy.js, prisma, @prisma/client, stripe, zod, react-hook-form
 
 REQUIREMENTS:
 - Next.js 15 with App Router (app/ directory)
@@ -36,7 +37,7 @@ REQUIREMENTS:
 - Tailwind CSS v4
 - shadcn/ui components (npx shadcn@latest init, then add needed components)
 - Dark theme ONLY — background #0d1117, no light mode
-- Lemon Squeezy checkout overlay for payments
+- Stripe Payment Link for payments (hosted checkout — use the URL directly as the Buy button href)
 - Landing page that converts: hero, problem, solution, pricing, FAQ
 - The actual tool/feature behind a paywall (cookie-based access after purchase)
 - Mobile responsive
@@ -56,9 +57,13 @@ REQUIREMENTS:
   to package.json dependencies and re-run npm install + npm run build until it passes.
 
 ENVIRONMENT VARIABLES (create .env.example):
-- NEXT_PUBLIC_LEMON_SQUEEZY_STORE_ID
-- NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID
-- LEMON_SQUEEZY_WEBHOOK_SECRET
+- NEXT_PUBLIC_STRIPE_PAYMENT_LINK  (full URL, e.g. https://buy.stripe.com/test_XXX)
+- NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY  (pk_test_... or pk_live_...)
+- STRIPE_WEBHOOK_SECRET  (set when webhook is wired)
+
+BUY BUTTON RULE: the Buy button's href MUST be `process.env.NEXT_PUBLIC_STRIPE_PAYMENT_LINK`
+used as-is — do NOT construct URLs from a product ID, do NOT prepend any base URL,
+do NOT wrap it in an embed iframe. The link opens Stripe's hosted checkout directly.
 
 After creating all files:
 1. Run: npm install

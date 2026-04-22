@@ -1,197 +1,126 @@
-import "server-only";
-
 import OpenAI from "openai";
 
-import type { CartItem, EmailVariant, VariantId } from "@/lib/database";
+import type { CartLineItem, EmailVariant } from "@/lib/database";
 
 type GenerateEmailInput = {
-  storeName: string;
-  customerName: string;
-  cartItems: CartItem[];
+  storeDomain: string;
+  customer: {
+    email: string;
+    firstName?: string;
+  };
+  cart: {
+    lineItems: CartLineItem[];
+    total: number;
+    currency: string;
+  };
   browsingSignals: string[];
-  cartValue: number;
-  currency: string;
 };
 
-export type GenerateEmailResult = {
-  reasoning: string;
-  variants: EmailVariant[];
+type GenerateEmailOutput = {
+  variantA: EmailVariant;
+  variantB: EmailVariant;
 };
 
-const openaiClient = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
+type AIResponseShape = {
+  variantA: {
+    subject: string;
+    body: string;
+  };
+  variantB: {
+    subject: string;
+    body: string;
+  };
+};
 
-function fallbackBody(input: GenerateEmailInput, variant: VariantId): string {
-  const firstItem = input.cartItems[0];
-  const itemSummary = input.cartItems
-    .map((item) => `${item.quantity}x ${item.title}`)
+const openaiClient =
+  process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim().length > 0
+    ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    : null;
+
+function fallbackVariant(input: GenerateEmailInput): GenerateEmailOutput {
+  const firstName = input.customer.firstName?.trim();
+  const opener = firstName ? `${firstName},` : "You";
+  const topItems = input.cart.lineItems
+    .slice(0, 3)
+    .map((item) => item.title)
     .join(", ");
 
-  if (variant === "A") {
-    return [
-      `Hi ${input.customerName || "there"},`,
-      "",
-      `You left ${itemSummary} in your cart at ${input.storeName}. These picks are still available right now, and we can have them moving today.`,
-      "",
-      `Your cart is worth ${input.currency} ${input.cartValue.toFixed(2)}. Check out now to lock in your selection before sizes or colors sell out.`,
-      "",
-      "Complete your order:",
-      "{{checkout_url}}",
-    ].join("\n");
-  }
-
-  const behaviorHook =
-    input.browsingSignals[0] ??
-    `You spent time comparing ${firstItem?.title ?? "your favorites"}`;
-
-  return [
-    `Hey ${input.customerName || "there"},`,
-    "",
-    `${behaviorHook}. We saved your cart so you can finish in one click.`,
-    "",
-    `You are only one step away from getting ${firstItem?.title ?? "your items"} delivered. Your ${input.currency} ${input.cartValue.toFixed(2)} cart is ready whenever you are.`,
-    "",
-    "Resume checkout:",
-    "{{checkout_url}}",
-  ].join("\n");
-}
-
-function buildFallback(input: GenerateEmailInput): GenerateEmailResult {
-  const topItem = input.cartItems[0]?.title ?? "your picks";
-
   return {
-    reasoning:
-      "Fallback mode used because OPENAI_API_KEY is missing or generation failed. Variants are generated from cart and browsing context.",
-    variants: [
-      {
-        variant: "A",
-        subject: `${input.customerName || "Your"}, your ${topItem} is still in your cart`,
-        body: fallbackBody(input, "A"),
-        cta: "Finish my order",
-      },
-      {
-        variant: "B",
-        subject: `Still thinking about ${topItem}? We saved your cart`,
-        body: fallbackBody(input, "B"),
-        cta: "Resume checkout",
-      },
-    ],
+    variantA: {
+      subject: `Still thinking it over? Your ${input.storeDomain} cart is ready`,
+      body: `${opener} left ${topItems} in your cart. Checkout takes less than 60 seconds and your items are still available right now.`
+    },
+    variantB: {
+      subject: `Quick nudge: your cart won't wait forever`,
+      body: `You were close to checkout. We saved your picks (${topItems}) so you can finish in one click. If you had any concerns, just reply to this email.`
+    }
   };
 }
 
-function sanitizeVariants(payload: unknown, fallback: GenerateEmailResult): EmailVariant[] {
-  if (!payload || typeof payload !== "object") {
-    return fallback.variants;
-  }
-
-  const variants = (payload as { variants?: unknown }).variants;
-  if (!Array.isArray(variants)) {
-    return fallback.variants;
-  }
-
-  const shaped = variants
-    .slice(0, 2)
-    .map((item, index) => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
-
-      const variant = index === 0 ? "A" : "B";
-      const subject = String((item as { subject?: unknown }).subject ?? "").trim();
-      const body = String((item as { body?: unknown }).body ?? "").trim();
-      const cta = String((item as { cta?: unknown }).cta ?? "").trim();
-
-      if (!subject || !body || !cta) {
-        return null;
-      }
-
-      return {
-        variant,
-        subject,
-        body,
-        cta,
-      } as EmailVariant;
-    })
-    .filter(Boolean) as EmailVariant[];
-
-  if (shaped.length !== 2) {
-    return fallback.variants;
-  }
-
-  return shaped;
+function safeTrim(variant: EmailVariant): EmailVariant {
+  return {
+    subject: variant.subject.trim().slice(0, 140),
+    body: variant.body.trim().slice(0, 2500)
+  };
 }
 
-export async function generatePersonalizedEmail(
-  input: GenerateEmailInput,
-): Promise<GenerateEmailResult> {
-  const fallback = buildFallback(input);
-
+export async function generateAbandonEmail(input: GenerateEmailInput) {
   if (!openaiClient) {
-    return fallback;
+    return fallbackVariant(input);
   }
 
-  const itemLines = input.cartItems
-    .map((item) => `- ${item.quantity}x ${item.title} (${input.currency} ${item.price.toFixed(2)})`)
-    .join("\n");
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-  const signalLines =
-    input.browsingSignals.length > 0
-      ? input.browsingSignals.map((signal) => `- ${signal}`).join("\n")
-      : "- No behavior signals available";
+  const systemPrompt =
+    "You write high-converting Shopify abandon-cart emails. Always return strict JSON with variantA and variantB, each with subject and body. Keep body under 120 words, plain text, no markdown.";
 
-  const prompt = [
-    "You write abandoned cart emails for Shopify stores.",
-    "Return strict JSON with fields: reasoning, variants.",
-    "variants must be exactly 2 objects with fields subject, body, cta.",
-    "Rules:",
-    "- Keep each subject under 60 characters.",
-    "- Body between 70 and 140 words.",
-    "- Mention at least one concrete cart item and one behavior signal.",
-    "- Include '{{checkout_url}}' exactly once in each body.",
-    "- No fake scarcity, no deceptive language.",
-    "",
-    `Store: ${input.storeName}`,
-    `Customer: ${input.customerName}`,
-    `Cart value: ${input.currency} ${input.cartValue.toFixed(2)}`,
-    "Cart items:",
-    itemLines,
-    "Browsing signals:",
-    signalLines,
-  ].join("\n");
+  const userPrompt = JSON.stringify(
+    {
+      storeDomain: input.storeDomain,
+      customer: input.customer,
+      cart: input.cart,
+      browsingSignals: input.browsingSignals,
+      goals: [
+        "Increase conversions without sounding spammy",
+        "Use specific product references",
+        "Different angle per variant for A/B testing"
+      ]
+    },
+    null,
+    2
+  );
 
   try {
     const completion = await openaiClient.chat.completions.create({
-      model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-      temperature: 0.8,
+      model,
+      temperature: 0.9,
       response_format: { type: "json_object" },
       messages: [
-        {
-          role: "system",
-          content:
-            "You are a conversion copywriter specializing in ethical lifecycle email for ecommerce.",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ]
     });
 
-    const raw = completion.choices[0]?.message?.content;
-    if (!raw) {
-      return fallback;
+    const content = completion.choices[0]?.message?.content;
+    if (!content) {
+      return fallbackVariant(input);
     }
 
-    const parsed = JSON.parse(raw) as { reasoning?: string; variants?: unknown };
+    const parsed = JSON.parse(content) as AIResponseShape;
+    if (
+      !parsed.variantA?.subject ||
+      !parsed.variantA?.body ||
+      !parsed.variantB?.subject ||
+      !parsed.variantB?.body
+    ) {
+      return fallbackVariant(input);
+    }
+
     return {
-      reasoning:
-        typeof parsed.reasoning === "string" && parsed.reasoning.trim().length > 0
-          ? parsed.reasoning.trim()
-          : fallback.reasoning,
-      variants: sanitizeVariants(parsed, fallback),
+      variantA: safeTrim(parsed.variantA),
+      variantB: safeTrim(parsed.variantB)
     };
   } catch {
-    return fallback;
+    return fallbackVariant(input);
   }
 }

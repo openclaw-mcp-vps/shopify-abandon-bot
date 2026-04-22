@@ -1,79 +1,127 @@
+import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 
-import { listCampaigns, summarizeCampaigns, updateCampaign } from "@/lib/database";
-import { parseAccessToken, PAYWALL_COOKIE_NAME } from "@/lib/paywall";
+import { generateAbandonEmail } from "@/lib/ai";
+import { getCampaigns, getDashboardMetrics, saveCampaign } from "@/lib/database";
+import { sendAbandonEmail } from "@/lib/email";
+import { verifyAccessToken } from "@/lib/paywall";
+import { createCampaignSchema } from "@/lib/schemas";
 
-function getAccessPayload(request: Request) {
-  const cookieHeader = request.headers.get("cookie") || "";
-  const token = cookieHeader
-    .split(";")
-    .map((item) => item.trim())
-    .find((item) => item.startsWith(`${PAYWALL_COOKIE_NAME}=`))
-    ?.split("=")
-    ?.slice(1)
-    ?.join("=");
-
-  return parseAccessToken(token);
+function pickVariant(seed: string): "A" | "B" {
+  const hash = crypto.createHash("sha256").update(seed).digest("hex");
+  return parseInt(hash.slice(0, 2), 16) % 2 === 0 ? "A" : "B";
 }
 
-export async function GET(request: Request): Promise<NextResponse> {
-  const access = getAccessPayload(request);
+function getAccessFromRequest(request: Request) {
+  const cookieHeader = request.headers.get("cookie") || "";
+  const cookieValue = cookieHeader
+    .split(";")
+    .map((entry) => entry.trim())
+    .find((entry) => entry.startsWith("sab_access="))
+    ?.split("=")
+    .slice(1)
+    .join("=");
+
+  return verifyAccessToken(cookieValue);
+}
+
+export async function GET(request: Request) {
+  const access = getAccessFromRequest(request);
   if (!access) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const url = new URL(request.url);
-  const storeDomain = url.searchParams.get("store");
-  const campaigns = await listCampaigns(storeDomain || undefined);
+  const storeDomain = url.searchParams.get("storeDomain") || undefined;
+  const campaigns = getCampaigns({ storeDomain, limit: 100 });
+  const metrics = getDashboardMetrics(storeDomain);
 
   return NextResponse.json({
-    ok: true,
     campaigns,
-    summary: summarizeCampaigns(campaigns)
+    metrics
   });
 }
 
-export async function POST(request: Request): Promise<NextResponse> {
-  const access = getAccessPayload(request);
+export async function POST(request: Request) {
+  const access = getAccessFromRequest(request);
   if (!access) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const body = (await request.json()) as {
-    action?: "mark_opened" | "mark_converted";
-    campaignId?: string;
-  };
+  const payload = await request.json().catch(() => null);
+  const parsed = createCampaignSchema.safeParse(payload);
 
-  if (!body.action || !body.campaignId) {
+  if (!parsed.success) {
     return NextResponse.json(
       {
-        error: "action and campaignId are required"
+        error: "Invalid campaign payload",
+        details: parsed.error.flatten()
       },
       { status: 400 }
     );
   }
 
-  const updated = await updateCampaign(body.campaignId, (campaign) => {
-    if (body.action === "mark_opened") {
-      return {
-        ...campaign,
-        status: campaign.status === "converted" ? "converted" : "opened",
-        openedAt: campaign.openedAt || new Date().toISOString()
-      };
-    }
+  const data = parsed.data;
 
-    return {
-      ...campaign,
-      status: "converted",
-      convertedAt: new Date().toISOString(),
-      openedAt: campaign.openedAt || new Date().toISOString(),
-      recoveredRevenue: campaign.cartValue
-    };
+  const generated = await generateAbandonEmail({
+    storeDomain: data.storeDomain,
+    customer: {
+      email: data.customerEmail,
+      firstName: data.customerName
+    },
+    cart: {
+      lineItems: data.lineItems,
+      total: data.cartValue,
+      currency: data.currency
+    },
+    browsingSignals: data.browsingSignals
   });
 
-  if (!updated) {
-    return NextResponse.json({ error: "Campaign not found" }, { status: 404 });
+  const selectedVariant = pickVariant(`${data.customerEmail}:${Date.now()}`);
+  const selectedContent = selectedVariant === "A" ? generated.variantA : generated.variantB;
+
+  let status: "queued" | "sent" | "failed" = "queued";
+  let providerId: string | undefined;
+
+  if (data.sendNow) {
+    try {
+      const sendResult = await sendAbandonEmail({
+        to: data.customerEmail,
+        subject: selectedContent.subject,
+        body: selectedContent.body
+      });
+
+      status = sendResult.status === "sent" ? "sent" : "queued";
+      providerId = sendResult.id;
+    } catch {
+      status = "failed";
+    }
   }
 
-  return NextResponse.json({ ok: true, campaign: updated });
+  const campaign = saveCampaign({
+    storeDomain: data.storeDomain,
+    customerEmail: data.customerEmail,
+    customerName: data.customerName,
+    source: "manual",
+    cartValue: data.cartValue,
+    currency: data.currency,
+    lineItems: data.lineItems,
+    browsingSignals: data.browsingSignals,
+    variantA: generated.variantA,
+    variantB: generated.variantB,
+    sentVariant: selectedVariant,
+    emailProviderId: providerId,
+    status,
+    metrics: {
+      opened: false,
+      clicked: false,
+      converted: false,
+      recoveredRevenue: 0
+    }
+  });
+
+  return NextResponse.json({
+    success: true,
+    campaign
+  });
 }

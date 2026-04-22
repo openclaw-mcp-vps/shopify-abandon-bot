@@ -1,553 +1,335 @@
-import "server-only";
-
-import fs from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import Database from "better-sqlite3";
+import crypto from "node:crypto";
 
-export type CartItem = {
+export type CartLineItem = {
+  productId?: string;
+  variantId?: string;
   title: string;
+  variantTitle?: string;
   quantity: number;
-  unitPrice: number;
-  variant?: string;
-  productUrl?: string;
+  price: number;
 };
 
-export type BrowseEvent = {
-  path: string;
-  title?: string;
-  category?: string;
-  secondsOnPage?: number;
-};
-
-export type DashboardSummary = {
-  abandonedCarts: number;
-  emailsSent: number;
-  recoveredOrders: number;
-  recoveredRevenue: number;
-  conversionRate: number;
-  estimatedUplift: number;
-};
-
-export type DashboardSeriesPoint = {
-  day: string;
-  sent: number;
-  recovered: number;
-  revenue: number;
-};
-
-export type VariantMetrics = {
-  variant: "A" | "B";
-  sent: number;
-  opens: number;
-  clicks: number;
-  conversions: number;
-  revenue: number;
-  openRate: number;
-  clickRate: number;
-  conversionRate: number;
-};
-
-export type EmailPreview = {
-  id: number;
-  customerEmail: string;
-  customerName: string | null;
-  shopDomain: string;
-  cartTotal: number;
-  currency: string;
-  variant: "A" | "B";
+export type EmailVariant = {
   subject: string;
   body: string;
-  sentAt: string;
-  opens: number;
-  clicks: number;
-  conversions: number;
-  revenue: number;
 };
 
-const dataDir = path.join(process.cwd(), "data");
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
-
-const databasePath = process.env.DATABASE_PATH
-  ? path.resolve(process.env.DATABASE_PATH)
-  : path.join(dataDir, "shopify-abandon-bot.db");
-
-const db = new Database(databasePath);
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS stores (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    shop_domain TEXT NOT NULL UNIQUE,
-    access_token TEXT NOT NULL,
-    installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS purchases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT NOT NULL UNIQUE,
-    order_id TEXT,
-    status TEXT NOT NULL,
-    plan_name TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS carts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    shop_domain TEXT NOT NULL,
-    cart_token TEXT NOT NULL,
-    customer_email TEXT NOT NULL,
-    customer_name TEXT,
-    total_price REAL NOT NULL,
-    currency TEXT NOT NULL,
-    items_json TEXT NOT NULL,
-    browse_json TEXT NOT NULL,
-    abandoned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    recovered_order_value REAL NOT NULL DEFAULT 0,
-    UNIQUE(shop_domain, cart_token)
-  );
-
-  CREATE TABLE IF NOT EXISTS emails (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cart_id INTEGER NOT NULL,
-    variant TEXT NOT NULL CHECK (variant IN ('A', 'B')),
-    subject TEXT NOT NULL,
-    body TEXT NOT NULL,
-    provider_message_id TEXT,
-    sent_at TEXT,
-    opens INTEGER NOT NULL DEFAULT 0,
-    clicks INTEGER NOT NULL DEFAULT 0,
-    conversions INTEGER NOT NULL DEFAULT 0,
-    revenue REAL NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(cart_id, variant),
-    FOREIGN KEY (cart_id) REFERENCES carts(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_carts_shop_domain ON carts(shop_domain);
-  CREATE INDEX IF NOT EXISTS idx_emails_cart_id ON emails(cart_id);
-  CREATE INDEX IF NOT EXISTS idx_emails_sent_at ON emails(sent_at);
-`);
-
-export function upsertStoreAuth(input: { shopDomain: string; accessToken: string }) {
-  const normalizedShop = input.shopDomain.toLowerCase();
-  db.prepare(
-    `
-      INSERT INTO stores (shop_domain, access_token)
-      VALUES (?, ?)
-      ON CONFLICT(shop_domain)
-      DO UPDATE SET
-        access_token = excluded.access_token,
-        updated_at = CURRENT_TIMESTAMP
-    `
-  ).run(normalizedShop, input.accessToken);
-}
-
-export function createOrUpdateCart(input: {
-  shopDomain: string;
-  cartToken: string;
+export type CampaignRecord = {
+  id: string;
+  storeDomain: string;
   customerEmail: string;
   customerName?: string;
-  totalPrice: number;
+  source: "shopify-webhook" | "manual";
+  cartValue: number;
   currency: string;
-  items: CartItem[];
-  browseHistory: BrowseEvent[];
-}) {
-  const normalizedShop = input.shopDomain.toLowerCase();
-  const normalizedEmail = input.customerEmail.toLowerCase();
-  const existing = db
-    .prepare(
-      `
-        SELECT id
-        FROM carts
-        WHERE shop_domain = ? AND cart_token = ?
-      `
-    )
-    .get(normalizedShop, input.cartToken) as { id: number } | undefined;
-
-  if (existing) {
-    db.prepare(
-      `
-        UPDATE carts
-        SET customer_email = ?,
-            customer_name = ?,
-            total_price = ?,
-            currency = ?,
-            items_json = ?,
-            browse_json = ?,
-            abandoned_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `
-    ).run(
-      normalizedEmail,
-      input.customerName ?? null,
-      input.totalPrice,
-      input.currency,
-      JSON.stringify(input.items),
-      JSON.stringify(input.browseHistory),
-      existing.id
-    );
-
-    return { cartId: existing.id, isNew: false };
-  }
-
-  const insertResult = db
-    .prepare(
-      `
-        INSERT INTO carts (
-          shop_domain,
-          cart_token,
-          customer_email,
-          customer_name,
-          total_price,
-          currency,
-          items_json,
-          browse_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `
-    )
-    .run(
-      normalizedShop,
-      input.cartToken,
-      normalizedEmail,
-      input.customerName ?? null,
-      input.totalPrice,
-      input.currency,
-      JSON.stringify(input.items),
-      JSON.stringify(input.browseHistory)
-    );
-
-  return { cartId: Number(insertResult.lastInsertRowid), isNew: true };
-}
-
-export function hasSentEmailForCart(cartId: number) {
-  const row = db
-    .prepare(
-      `
-        SELECT id
-        FROM emails
-        WHERE cart_id = ? AND sent_at IS NOT NULL
-        LIMIT 1
-      `
-    )
-    .get(cartId) as { id: number } | undefined;
-
-  return Boolean(row);
-}
-
-export function saveGeneratedEmailVariant(input: {
-  cartId: number;
-  variant: "A" | "B";
-  subject: string;
-  body: string;
-}) {
-  db.prepare(
-    `
-      INSERT INTO emails (cart_id, variant, subject, body)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(cart_id, variant)
-      DO UPDATE SET
-        subject = excluded.subject,
-        body = excluded.body,
-        created_at = CURRENT_TIMESTAMP
-    `
-  ).run(input.cartId, input.variant, input.subject, input.body);
-
-  const row = db
-    .prepare(
-      `
-        SELECT id
-        FROM emails
-        WHERE cart_id = ? AND variant = ?
-      `
-    )
-    .get(input.cartId, input.variant) as { id: number };
-
-  return row.id;
-}
-
-export function getEmailById(emailId: number) {
-  return db
-    .prepare(
-      `
-        SELECT
-          e.id,
-          e.variant,
-          e.subject,
-          e.body,
-          e.sent_at AS sentAt,
-          c.customer_email AS customerEmail,
-          c.customer_name AS customerName,
-          c.shop_domain AS shopDomain,
-          c.total_price AS cartTotal,
-          c.currency AS currency
-        FROM emails e
-        JOIN carts c ON c.id = e.cart_id
-        WHERE e.id = ?
-      `
-    )
-    .get(emailId) as
-    | {
-        id: number;
-        variant: "A" | "B";
-        subject: string;
-        body: string;
-        sentAt: string | null;
-        customerEmail: string;
-        customerName: string | null;
-        shopDomain: string;
-        cartTotal: number;
-        currency: string;
-      }
-    | undefined;
-}
-
-export function markEmailSent(emailId: number, providerMessageId?: string) {
-  db.prepare(
-    `
-      UPDATE emails
-      SET sent_at = COALESCE(sent_at, CURRENT_TIMESTAMP),
-          provider_message_id = ?
-      WHERE id = ?
-    `
-  ).run(providerMessageId ?? null, emailId);
-}
-
-export function recordEmailOpen(emailId: number) {
-  db.prepare(
-    `
-      UPDATE emails
-      SET opens = opens + 1
-      WHERE id = ?
-    `
-  ).run(emailId);
-}
-
-export function recordEmailClick(emailId: number) {
-  db.prepare(
-    `
-      UPDATE emails
-      SET clicks = clicks + 1
-      WHERE id = ?
-    `
-  ).run(emailId);
-}
-
-export function recordRecoveredOrder(input: {
-  shopDomain: string;
-  cartToken: string;
-  orderValue: number;
-}) {
-  const normalizedShop = input.shopDomain.toLowerCase();
-
-  const emailRow = db
-    .prepare(
-      `
-        SELECT e.id
-        FROM emails e
-        JOIN carts c ON c.id = e.cart_id
-        WHERE c.shop_domain = ?
-          AND c.cart_token = ?
-          AND e.sent_at IS NOT NULL
-        ORDER BY e.sent_at DESC
-        LIMIT 1
-      `
-    )
-    .get(normalizedShop, input.cartToken) as { id: number } | undefined;
-
-  if (!emailRow) {
-    return false;
-  }
-
-  db.prepare(
-    `
-      UPDATE emails
-      SET conversions = conversions + 1,
-          revenue = revenue + ?,
-          clicks = clicks + 1,
-          opens = opens + 1
-      WHERE id = ?
-    `
-  ).run(input.orderValue, emailRow.id);
-
-  db.prepare(
-    `
-      UPDATE carts
-      SET recovered_order_value = recovered_order_value + ?
-      WHERE shop_domain = ? AND cart_token = ?
-    `
-  ).run(input.orderValue, normalizedShop, input.cartToken);
-
-  return true;
-}
-
-export function recordLemonPurchase(input: {
-  email: string;
-  orderId?: string;
-  status: "active" | "cancelled" | "refunded";
-  planName?: string;
-}) {
-  const normalizedEmail = input.email.toLowerCase();
-
-  db.prepare(
-    `
-      INSERT INTO purchases (email, order_id, status, plan_name)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(email)
-      DO UPDATE SET
-        order_id = excluded.order_id,
-        status = excluded.status,
-        plan_name = excluded.plan_name,
-        updated_at = CURRENT_TIMESTAMP
-    `
-  ).run(normalizedEmail, input.orderId ?? null, input.status, input.planName ?? null);
-}
-
-export function hasActivePurchase(email: string) {
-  const normalizedEmail = email.toLowerCase();
-  const row = db
-    .prepare(
-      `
-        SELECT status
-        FROM purchases
-        WHERE email = ?
-      `
-    )
-    .get(normalizedEmail) as { status: string } | undefined;
-
-  return row?.status === "active";
-}
-
-export function getDashboardSnapshot() {
-  const summaryRow = db
-    .prepare(
-      `
-        SELECT
-          COUNT(DISTINCT c.id) AS abandonedCarts,
-          COALESCE(SUM(CASE WHEN e.sent_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS emailsSent,
-          COALESCE(SUM(e.conversions), 0) AS recoveredOrders,
-          COALESCE(SUM(e.revenue), 0) AS recoveredRevenue
-        FROM carts c
-        LEFT JOIN emails e ON e.cart_id = c.id
-      `
-    )
-    .get() as {
-    abandonedCarts: number;
-    emailsSent: number;
-    recoveredOrders: number;
+  lineItems: CartLineItem[];
+  browsingSignals: string[];
+  variantA: EmailVariant;
+  variantB: EmailVariant;
+  sentVariant: "A" | "B";
+  emailProviderId?: string;
+  status: "queued" | "sent" | "failed";
+  metrics: {
+    opened: boolean;
+    clicked: boolean;
+    converted: boolean;
     recoveredRevenue: number;
   };
+  createdAt: string;
+  updatedAt: string;
+};
 
-  const conversionRate =
-    summaryRow.emailsSent > 0 ? (summaryRow.recoveredOrders / summaryRow.emailsSent) * 100 : 0;
+export type StoreRecord = {
+  id: string;
+  shopDomain: string;
+  accessToken?: string;
+  ownerEmail?: string;
+  createdAt: string;
+  updatedAt: string;
+};
 
-  const estimatedUplift = Math.max(conversionRate - 10, 0);
+export type PaymentRecord = {
+  id: string;
+  provider: "stripe" | "lemonsqueezy";
+  customerEmail: string;
+  active: boolean;
+  storeLimit: number;
+  referenceId: string;
+  metadata?: Record<string, string | number | boolean>;
+  createdAt: string;
+  updatedAt: string;
+};
 
-  const summary: DashboardSummary = {
-    abandonedCarts: summaryRow.abandonedCarts ?? 0,
-    emailsSent: summaryRow.emailsSent ?? 0,
-    recoveredOrders: summaryRow.recoveredOrders ?? 0,
-    recoveredRevenue: summaryRow.recoveredRevenue ?? 0,
-    conversionRate,
-    estimatedUplift
+export type WebhookEventRecord = {
+  id: string;
+  provider: "shopify" | "stripe" | "lemonsqueezy";
+  topic: string;
+  payload: Record<string, unknown>;
+  receivedAt: string;
+};
+
+type DatabaseSchema = {
+  stores: StoreRecord[];
+  campaigns: CampaignRecord[];
+  payments: PaymentRecord[];
+  webhookEvents: WebhookEventRecord[];
+};
+
+const DATA_DIR = path.join(process.cwd(), "data");
+const DB_FILE = path.join(DATA_DIR, "app-db.json");
+
+function initialData(): DatabaseSchema {
+  return {
+    stores: [],
+    campaigns: [],
+    payments: [],
+    webhookEvents: []
   };
+}
 
-  const seriesRows = db
-    .prepare(
-      `
-        SELECT
-          date(c.abandoned_at) AS day,
-          COALESCE(SUM(CASE WHEN e.sent_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS sent,
-          COALESCE(SUM(e.conversions), 0) AS recovered,
-          COALESCE(SUM(e.revenue), 0) AS revenue
-        FROM carts c
-        LEFT JOIN emails e ON e.cart_id = c.id
-        WHERE c.abandoned_at >= datetime('now', '-13 day')
-        GROUP BY day
-        ORDER BY day ASC
-      `
-    )
-    .all() as DashboardSeriesPoint[];
+function ensureDbFile() {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
 
-  const variantRows = db
-    .prepare(
-      `
-        SELECT
-          variant,
-          COALESCE(SUM(CASE WHEN sent_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS sent,
-          COALESCE(SUM(opens), 0) AS opens,
-          COALESCE(SUM(clicks), 0) AS clicks,
-          COALESCE(SUM(conversions), 0) AS conversions,
-          COALESCE(SUM(revenue), 0) AS revenue
-        FROM emails
-        GROUP BY variant
-        ORDER BY variant ASC
-      `
-    )
-    .all() as Array<{
-    variant: "A" | "B";
-    sent: number;
-    opens: number;
-    clicks: number;
-    conversions: number;
-    revenue: number;
-  }>;
+  if (!existsSync(DB_FILE)) {
+    writeFileSync(DB_FILE, JSON.stringify(initialData(), null, 2), "utf8");
+  }
+}
 
-  const variants: VariantMetrics[] = (["A", "B"] as const).map((variantLabel) => {
-    const row = variantRows.find((entry) => entry.variant === variantLabel);
-    const sent = row?.sent ?? 0;
-    const opens = row?.opens ?? 0;
-    const clicks = row?.clicks ?? 0;
-    const conversions = row?.conversions ?? 0;
-    const revenue = row?.revenue ?? 0;
+function readDb(): DatabaseSchema {
+  ensureDbFile();
 
-    return {
-      variant: variantLabel,
-      sent,
-      opens,
-      clicks,
-      conversions,
-      revenue,
-      openRate: sent > 0 ? (opens / sent) * 100 : 0,
-      clickRate: sent > 0 ? (clicks / sent) * 100 : 0,
-      conversionRate: sent > 0 ? (conversions / sent) * 100 : 0
-    };
-  });
-
-  const previews = db
-    .prepare(
-      `
-        SELECT
-          e.id,
-          c.customer_email AS customerEmail,
-          c.customer_name AS customerName,
-          c.shop_domain AS shopDomain,
-          c.total_price AS cartTotal,
-          c.currency AS currency,
-          e.variant,
-          e.subject,
-          e.body,
-          e.sent_at AS sentAt,
-          e.opens,
-          e.clicks,
-          e.conversions,
-          e.revenue
-        FROM emails e
-        JOIN carts c ON c.id = e.cart_id
-        WHERE e.sent_at IS NOT NULL
-        ORDER BY e.sent_at DESC
-        LIMIT 8
-      `
-    )
-    .all() as EmailPreview[];
+  const raw = readFileSync(DB_FILE, "utf8");
+  const parsed = JSON.parse(raw) as DatabaseSchema;
 
   return {
-    summary,
-    series: seriesRows,
-    variants,
-    previews
+    stores: parsed.stores ?? [],
+    campaigns: parsed.campaigns ?? [],
+    payments: parsed.payments ?? [],
+    webhookEvents: parsed.webhookEvents ?? []
   };
+}
+
+function writeDb(next: DatabaseSchema) {
+  ensureDbFile();
+  writeFileSync(DB_FILE, JSON.stringify(next, null, 2), "utf8");
+}
+
+export function logWebhookEvent(
+  provider: WebhookEventRecord["provider"],
+  topic: string,
+  payload: Record<string, unknown>
+) {
+  const db = readDb();
+  db.webhookEvents.unshift({
+    id: crypto.randomUUID(),
+    provider,
+    topic,
+    payload,
+    receivedAt: new Date().toISOString()
+  });
+
+  db.webhookEvents = db.webhookEvents.slice(0, 1000);
+  writeDb(db);
+}
+
+export function upsertStore(input: {
+  shopDomain: string;
+  accessToken?: string;
+  ownerEmail?: string;
+}) {
+  const db = readDb();
+  const now = new Date().toISOString();
+
+  const existing = db.stores.find((store) => store.shopDomain === input.shopDomain);
+
+  if (existing) {
+    existing.updatedAt = now;
+    if (input.accessToken) {
+      existing.accessToken = input.accessToken;
+    }
+    if (input.ownerEmail) {
+      existing.ownerEmail = input.ownerEmail;
+    }
+
+    writeDb(db);
+    return existing;
+  }
+
+  const created: StoreRecord = {
+    id: crypto.randomUUID(),
+    shopDomain: input.shopDomain,
+    accessToken: input.accessToken,
+    ownerEmail: input.ownerEmail,
+    createdAt: now,
+    updatedAt: now
+  };
+
+  db.stores.unshift(created);
+  writeDb(db);
+  return created;
+}
+
+export function getStoreByDomain(shopDomain: string) {
+  const db = readDb();
+  return db.stores.find((store) => store.shopDomain === shopDomain) ?? null;
+}
+
+export function saveCampaign(
+  campaign: Omit<CampaignRecord, "id" | "createdAt" | "updatedAt">
+) {
+  const db = readDb();
+  const now = new Date().toISOString();
+
+  const created: CampaignRecord = {
+    ...campaign,
+    id: crypto.randomUUID(),
+    createdAt: now,
+    updatedAt: now
+  };
+
+  db.campaigns.unshift(created);
+  writeDb(db);
+  return created;
+}
+
+export function updateCampaign(
+  campaignId: string,
+  updates: Partial<
+    Pick<CampaignRecord, "status" | "emailProviderId" | "metrics" | "sentVariant">
+  >
+) {
+  const db = readDb();
+  const campaign = db.campaigns.find((item) => item.id === campaignId);
+
+  if (!campaign) {
+    return null;
+  }
+
+  if (updates.status) {
+    campaign.status = updates.status;
+  }
+
+  if (updates.emailProviderId) {
+    campaign.emailProviderId = updates.emailProviderId;
+  }
+
+  if (updates.sentVariant) {
+    campaign.sentVariant = updates.sentVariant;
+  }
+
+  if (updates.metrics) {
+    campaign.metrics = updates.metrics;
+  }
+
+  campaign.updatedAt = new Date().toISOString();
+  writeDb(db);
+  return campaign;
+}
+
+export function getCampaigns(options?: { storeDomain?: string; limit?: number }) {
+  const db = readDb();
+
+  let rows = db.campaigns;
+  if (options?.storeDomain) {
+    rows = rows.filter((item) => item.storeDomain === options.storeDomain);
+  }
+
+  if (options?.limit) {
+    rows = rows.slice(0, options.limit);
+  }
+
+  return rows;
+}
+
+export function getDashboardMetrics(storeDomain?: string) {
+  const campaigns = getCampaigns({ storeDomain });
+
+  const total = campaigns.length;
+  const sent = campaigns.filter((item) => item.status === "sent").length;
+  const opened = campaigns.filter((item) => item.metrics.opened).length;
+  const clicked = campaigns.filter((item) => item.metrics.clicked).length;
+  const converted = campaigns.filter((item) => item.metrics.converted).length;
+  const recoveredRevenue = campaigns.reduce(
+    (sum, item) => sum + item.metrics.recoveredRevenue,
+    0
+  );
+
+  return {
+    totalCampaigns: total,
+    sentCampaigns: sent,
+    openRate: sent > 0 ? opened / sent : 0,
+    clickRate: sent > 0 ? clicked / sent : 0,
+    conversionRate: sent > 0 ? converted / sent : 0,
+    recoveredRevenue
+  };
+}
+
+export function upsertPayment(input: {
+  provider: PaymentRecord["provider"];
+  customerEmail: string;
+  active: boolean;
+  storeLimit: number;
+  referenceId: string;
+  metadata?: Record<string, string | number | boolean>;
+}) {
+  const db = readDb();
+  const now = new Date().toISOString();
+  const normalizedEmail = input.customerEmail.toLowerCase();
+
+  if (!input.active) {
+    for (const payment of db.payments) {
+      if (
+        payment.provider === input.provider &&
+        payment.customerEmail === normalizedEmail &&
+        payment.active
+      ) {
+        payment.active = false;
+        payment.updatedAt = now;
+      }
+    }
+  }
+
+  const existing = db.payments.find(
+    (payment) =>
+      payment.provider === input.provider && payment.referenceId === input.referenceId
+  );
+
+  if (existing) {
+    existing.customerEmail = normalizedEmail;
+    existing.active = input.active;
+    existing.storeLimit = input.storeLimit;
+    existing.metadata = input.metadata;
+    existing.updatedAt = now;
+    writeDb(db);
+    return existing;
+  }
+
+  const created: PaymentRecord = {
+    id: crypto.randomUUID(),
+    provider: input.provider,
+    customerEmail: normalizedEmail,
+    active: input.active,
+    storeLimit: input.storeLimit,
+    referenceId: input.referenceId,
+    metadata: input.metadata,
+    createdAt: now,
+    updatedAt: now
+  };
+
+  db.payments.unshift(created);
+  writeDb(db);
+  return created;
+}
+
+export function getActivePaymentByEmail(email: string) {
+  const db = readDb();
+  return (
+    db.payments.find(
+      (payment) => payment.customerEmail === email.toLowerCase() && payment.active
+    ) ?? null
+  );
 }
